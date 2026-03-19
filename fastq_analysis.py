@@ -1394,7 +1394,7 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
     st.caption("Point to a run folder — the app auto-detects all targets and processes each one.")
 
     folder_path = st.text_input("Path to run folder",
-                                 placeholder="/Users/ishanghosh/Downloads/run5")
+                                 placeholder="/Users/your_username/Downloads/run5")
 
     if folder_path.strip():
         p = Path(folder_path.strip()).expanduser()
