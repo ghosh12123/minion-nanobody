@@ -48,7 +48,7 @@ mmseqs version
 ## Running the App
 
 ```bash
-streamlit run fastq_analysis_v2.py
+streamlit run fastq_analysis.py
 ```
 
 Then open your browser and go to `http://localhost:8501`.
