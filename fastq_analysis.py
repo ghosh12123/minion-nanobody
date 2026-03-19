@@ -1463,7 +1463,7 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
 
     elif ext_tg1_source == "Folder path":
         tg1_path_input = st.text_input("TG1 barcode folder path",
-            placeholder="/Users/ishanghosh/Downloads/run5/barcode06_P-aer_llama_TG1",
+            placeholder="/Users/your_username/Downloads/run5/barcode06_P-aer_llama_TG1",
             key="ext_tg1_path")
         if tg1_path_input.strip():
             resolved = Path(tg1_path_input.strip()).expanduser()
