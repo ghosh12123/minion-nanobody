@@ -823,15 +823,21 @@ def group_barcodes_by_target(barcodes: List[dict]) -> Dict[str, dict]:
         else:
             groups[target]["rounds"][round_num] = bc
 
-    # Second pass: for targets with no TG1, try prefix match
+    # Second pass: for targets with no TG1, try prefix match or global TG1
     tg1_barcodes = [bc for bc in barcodes if bc.get("round") == 0]
+    # A barcode named just "TG1" (target == "TG1") is a global TG1 for all targets
+    global_tg1 = next((bc for bc in tg1_barcodes if bc.get("target", "").upper() == "TG1"), None)
     for target, grp in groups.items():
         if grp["tg1"] is None:
+            # Try prefix match first
             for tg1_bc in tg1_barcodes:
                 tg1_target = tg1_bc.get("target", "")
-                if target.startswith(tg1_target):
+                if tg1_target.upper() != "TG1" and target.startswith(tg1_target):
                     grp["tg1"] = tg1_bc
                     break
+            # Fall back to global TG1
+            if grp["tg1"] is None and global_tg1:
+                grp["tg1"] = global_tg1
 
     # Remove targets with no rounds (pure TG1 barcodes with no panning)
     groups = {t: g for t, g in groups.items() if g["rounds"]}
