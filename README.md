@@ -1,4 +1,4 @@
-# MinION Nanobody Analysis v2
+# MinION Nanobody Analysis 
 
 A Streamlit web app for analyzing MinION nanobody sequencing data. Ingests FASTQ run folders, runs the trim-translate-cluster-normalize pipeline, and provides interactive enrichment analysis across panning rounds.
 
@@ -43,6 +43,13 @@ conda install -c conda-forge -c bioconda mmseqs2
 **Verify installation:**
 ```bash
 mmseqs version
+```
+
+## Download the Code
+
+```bash
+git clone https://github.com/YOUR_USERNAME/minion-nanobody.git
+cd minion-nanobody
 ```
 
 ## Running the App
