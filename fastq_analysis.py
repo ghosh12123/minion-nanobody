@@ -1,3 +1,10 @@
+"""
+MinION Nanobody Analysis — v2
+Ingest a full run folder — auto-detects all targets and runs the Test12.py
+pipeline (trim+translate, easy-cluster, normalize) for each target group.
+Results stored in SQLite. One ingest, all targets, instant reload.
+"""
+
 import gzip
 import hashlib
 import json
@@ -19,9 +26,21 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
-from Bio import SeqIO
+from io import StringIO
+import html as html_lib
+import time
+import requests
+from Bio import SeqIO, AlignIO
 from Bio.Seq import Seq
+from Bio.Align import MultipleSeqAlignment
+from Bio.SeqRecord import SeqRecord
+import matplotlib.colors as mcolors
 from plotly.subplots import make_subplots
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ALL FUNCTIONS BELOW TAKEN DIRECTLY FROM Test12.py — DO NOT MODIFY LOGIC
+# ═══════════════════════════════════════════════════════════════════════════════
 
 
 # -----------------------------
@@ -584,7 +603,7 @@ def plot_abundance_vs_differential(
     return fig, plot_data_diff
 
 
-# Plotly version for interactive hover (ID + AA sequence)
+# NEW: Plotly version for interactive hover (ID + AA sequence)
 def plot_abundance_vs_differential_plotly(
     count_matrix: pd.DataFrame,
     baseline_lib: str,
@@ -746,9 +765,515 @@ def plot_abundance_vs_differential_plotly(
 # -----------------------------
 
 
+# NEW: ClustalW (EMBL-EBI server) + MSA sorting + colored display
 # -----------------------------
+EBI_REST_ROOT = "https://www.ebi.ac.uk/Tools/services/rest"
+CLUSTALW_SERVICE = "clustalw2"
+
+AA20 = list("ACDEFGHIKLMNPQRSTVWY")
+AA_CATEGORIES = AA20 + ["B", "Z", "J", "X", "U", "O", "*", "-"]
+
+
+def _normalize_residue(ch: str) -> str:
+    ch = (ch or "").upper()
+    if ch == ".":
+        ch = "-"
+    if ch in AA_CATEGORIES:
+        return ch
+    if ch == "-":
+        return "-"
+    return "X"
+
+
+def build_aa_color_map() -> dict[str, str]:
+    """Deterministic per-amino-acid colors (20 distinct + a few extras)."""
+    cmap = plt.get_cmap("tab20")
+    colors = [mcolors.to_hex(cmap(i)) for i in range(20)]
+    aa_colors = {aa: colors[i] for i, aa in enumerate(AA20)}
+    aa_colors.update(
+        {
+            "-": "#FFFFFF",
+            "X": "#BDBDBD",
+            "B": "#CFCFCF",
+            "Z": "#CFCFCF",
+            "J": "#CFCFCF",
+            "U": "#CFCFCF",
+            "O": "#CFCFCF",
+            "*": "#000000",
+        }
+    )
+    return aa_colors
+
+
+def _ebi_get(service: str, path: str, timeout_s: int = 60) -> str:
+    url = f"{EBI_REST_ROOT}/{service}/{path.lstrip('/')}"
+    r = requests.get(url, timeout=timeout_s)
+    r.raise_for_status()
+    return r.text
+
+
+def _ebi_post_run(service: str, params: dict[str, str], timeout_s: int = 60) -> str:
+    url = f"{EBI_REST_ROOT}/{service}/run"
+
+    # IMPORTANT: do NOT send an "Expect" header; EBI may return 417 when it is present.
+    headers = {
+        "Accept": "text/plain",
+        "User-Agent": "nanobody-seq-analyzer/1.0",
+    }
+
+    r = requests.post(url, data=params, headers=headers, timeout=timeout_s)
+
+    # Helpful error message if EBI returns HTML/text describing the issue
+    try:
+        r.raise_for_status()
+    except requests.HTTPError as e:
+        raise requests.HTTPError(f"{e}\n\nEBI response body (first 1000 chars):\n{r.text[:1000]}") from e
+
+    job_id = r.text.strip()
+    if not job_id:
+        raise RuntimeError(f"Empty job id returned by {url}\nResponse:\n{r.text[:1000]}")
+    return job_id
+
+
+def _ebi_poll_status(
+    service: str, job_id: str, timeout_s: int = 900, poll_s: float = 2.0
+) -> str:
+    deadline = time.time() + float(timeout_s)
+    last = ""
+    while time.time() < deadline:
+        last = _ebi_get(service, f"status/{job_id}", timeout_s=60).strip().upper()
+        if last in {"FINISHED", "ERROR", "FAILURE", "NOT_FOUND"}:
+            return last
+        time.sleep(float(poll_s))
+    raise TimeoutError(f"EBI job timed out: {service} job_id={job_id} last_status={last}")
+
+
+def _ebi_result_types(service: str, job_id: str) -> list[str]:
+    xml = _ebi_get(service, f"resulttypes/{job_id}", timeout_s=60)
+    return re.findall(r"<identifier>(.*?)</identifier>", xml)
+
+
+def _pick_result_type(result_types: list[str], *, prefer: list[str]) -> str | None:
+    """
+    prefer: list of substrings that must all be present (case-insensitive).
+    """
+    rt_lower = [(rt, rt.lower()) for rt in result_types]
+    for rt, rtl in rt_lower:
+        if all(p.lower() in rtl for p in prefer):
+            return rt
+    return None
+
+
+@st.cache_data(show_spinner=False, ttl=7 * 24 * 3600)
+def clustalw2_align_via_ebi(
+    fasta_text: str,
+    email: str,
+    stype: str = "protein",
+    timeout_s: int = 900,
+) -> dict[str, str]:
+    """
+    Submit sequences to EMBL-EBI ClustalW2 server and return alignment text.
+    Returns dict with keys:
+      job_id, aln_fasta, aln_clustal (best-effort), result_types (json)
+    """
+    if not fasta_text or not fasta_text.strip():
+        raise ValueError("Empty FASTA input to ClustalW2.")
+    if not email or "@" not in email:
+        raise ValueError("A valid email address is required by the EMBL-EBI ClustalW2 service.")
+
+    job_id = _ebi_post_run(
+        CLUSTALW_SERVICE,
+        params={"email": email.strip(), "sequence": fasta_text, "stype": stype},
+        timeout_s=60,
+    )
+
+    status = _ebi_poll_status(CLUSTALW_SERVICE, job_id, timeout_s=timeout_s, poll_s=2.0)
+    if status != "FINISHED":
+        raise RuntimeError(f"ClustalW2 job failed: status={status}, job_id={job_id}")
+
+    rtypes = _ebi_result_types(CLUSTALW_SERVICE, job_id)
+
+    fasta_type = next(
+        (rt for rt in rtypes if "aln" in rt.lower() and "fasta" in rt.lower()),
+        None,
+    )
+
+    clustal_type = next(
+        (rt for rt in rtypes if "aln" in rt.lower() and "clustal" in rt.lower()),
+        None,
+    )
+    if clustal_type is None:
+        clustal_type = next((rt for rt in rtypes if rt.lower() == "aln"), None)
+
+    aln_fasta = _ebi_get(CLUSTALW_SERVICE, f"result/{job_id}/{fasta_type}") if fasta_type else ""
+    aln_clustal = _ebi_get(CLUSTALW_SERVICE, f"result/{job_id}/{clustal_type}") if clustal_type else ""
+
+    if not (aln_fasta.strip() or aln_clustal.strip()):
+        raise RuntimeError(f"EBI returned no alignment text. job_id={job_id} result_types={rtypes}")
+
+    return {
+        "job_id": job_id,
+        "aln_fasta": aln_fasta,
+        "aln_clustal": aln_clustal,
+        "result_types": json.dumps(rtypes),
+    }
+
+
+def _parse_clustal_loose(text: str) -> MultipleSeqAlignment:
+    """
+    Tolerant CLUSTAL parser:
+    - ignores consensus lines and non-sequence lines
+    - accepts optional trailing position numbers
+    """
+    seq_chunks: dict[str, list[str]] = {}
+    seen_header = False
+
+    for raw in (text or "").splitlines():
+        line = raw.rstrip("\n")
+
+        if not seen_header:
+            if line.lstrip().upper().startswith("CLUSTAL"):
+                seen_header = True
+            continue
+
+        if not line.strip():
+            continue
+
+        # consensus lines start with whitespace in CLUSTAL
+        if line[0].isspace():
+            continue
+
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+
+        sid = parts[0]
+        chunk = parts[1]
+
+        # skip junk lines
+        if not chunk or set(chunk) <= set("*:."):
+            continue
+
+        seq_chunks.setdefault(sid, []).append(chunk)
+
+    if not seq_chunks:
+        raise ValueError("No sequence lines found in CLUSTAL text (loose parser).")
+
+    records = [
+        SeqRecord(Seq("".join(chunks)), id=sid, description="")
+        for sid, chunks in seq_chunks.items()
+    ]
+
+    lengths = {len(r.seq) for r in records}
+    if len(lengths) != 1:
+        # Don’t silently “pad” this; it usually means the server output was truncated/odd.
+        lens_preview = {r.id: len(r.seq) for r in records}
+        raise ValueError(
+            "CLUSTAL parse produced sequences of unequal lengths; output may be truncated or nonstandard.\n"
+            f"Lengths: {lens_preview}"
+        )
+
+    return MultipleSeqAlignment(records)
+
+
+def parse_msa_auto(aln_text: str) -> MultipleSeqAlignment:
+    s = (aln_text or "").lstrip("\ufeff")  # strip BOM if present
+    if not s.strip():
+        raise ValueError("Empty alignment text returned by EBI.")
+
+    head = s.lstrip()[:500].lower()
+    if head.startswith("<!doctype html") or "<html" in head:
+        raise ValueError("EBI returned HTML, not an alignment. First 400 chars:\n" + s[:400])
+
+    looks_fasta = re.search(r"^>", s, flags=re.M) is not None
+    looks_clustal = s.lstrip().upper().startswith("CLUSTAL")
+
+    errors: dict[str, Exception] = {}
+
+    # Prefer what it looks like, but try both
+    fmt_order = []
+    if looks_fasta:
+        fmt_order.append("fasta")
+    if looks_clustal:
+        fmt_order.append("clustal")
+    for fmt in ("fasta", "clustal"):
+        if fmt not in fmt_order:
+            fmt_order.append(fmt)
+
+    # Try Biopython parsers first (use parse() not read() to tolerate extra sections)
+    for fmt in fmt_order:
+        try:
+            alns = list(AlignIO.parse(StringIO(s), fmt))
+            if alns:
+                return alns[0]
+        except Exception as e:
+            errors[fmt] = e
+
+    # If it’s CLUSTAL-like, fall back to tolerant parser
+    if looks_clustal:
+        try:
+            return _parse_clustal_loose(s)
+        except Exception as e:
+            errors["clustal_loose"] = e
+
+    msg = "Could not parse alignment as FASTA or CLUSTAL.\n"
+    for k, e in errors.items():
+        msg += f"- {k}: {type(e).__name__}: {e}\n"
+    msg += "\nFirst 400 chars:\n" + s.strip()[:400]
+    raise ValueError(msg)
+
+
+def pairwise_identity(a: str, b: str) -> float:
+    """Percent identity excluding columns where either sequence has a gap."""
+    matches = 0
+    compared = 0
+    for ca, cb in zip(a, b):
+        if ca == "-" or cb == "-":
+            continue
+        compared += 1
+        if ca == cb:
+            matches += 1
+    return (matches / compared) if compared else 0.0
+
+def sort_msa_by_pairwise(
+    aln: MultipleSeqAlignment,
+    mode: str = "Mean pairwise identity (desc)",
+) -> tuple[MultipleSeqAlignment, pd.DataFrame, pd.DataFrame]:
+    """
+    Sort an MSA and return:
+      - msa_sorted: MultipleSeqAlignment
+      - msa_rank_df: per-sequence ranking/metrics table
+      - pid_sorted: pairwise identity matrix (percent), sorted to match msa_sorted
+    mode must be one of:
+      - "Mean pairwise identity (desc)"
+      - "Identity to top-1 (desc)"
+      - "Server order"
+    """
+    if aln is None or len(aln) == 0:
+        empty_rank = pd.DataFrame(
+            columns=[
+                "rank",
+                "id",
+                "orig_index",
+                "mean_pairwise_identity_pct",
+                "identity_to_top1_pct",
+            ]
+        )
+        return aln, empty_rank, pd.DataFrame()
+
+    ids = [rec.id for rec in aln]
+    seqs = [str(rec.seq).upper().replace(".", "-") for rec in aln]
+
+    lengths = {len(s) for s in seqs}
+    if len(lengths) != 1:
+        raise ValueError(f"MSA sequences are not all the same length: {sorted(lengths)}")
+
+    n = len(seqs)
+    pid = np.zeros((n, n), dtype=float)
+
+    for i in range(n):
+        pid[i, i] = 100.0 * pairwise_identity(seqs[i], seqs[i])
+        for j in range(i + 1, n):
+            v = 100.0 * pairwise_identity(seqs[i], seqs[j])
+            pid[i, j] = v
+            pid[j, i] = v
+
+    if n > 1:
+        mean_pid = (pid.sum(axis=1) - np.diag(pid)) / float(n - 1)
+    else:
+        mean_pid = np.array([np.nan], dtype=float)
+
+    pid_to_top1 = pid[:, 0].copy()  # identity to first sequence in current (server) order
+
+    if mode == "Server order":
+        order = list(range(n))
+    elif mode == "Mean pairwise identity (desc)":
+        order = sorted(range(n), key=lambda i: (-mean_pid[i], i))
+    elif mode == "Identity to top-1 (desc)":
+        order = sorted(range(n), key=lambda i: (-pid_to_top1[i], i))
+    else:
+        raise ValueError(f"Unknown MSA_SORT_MODE: {mode}")
+
+    msa_sorted = MultipleSeqAlignment([aln[i] for i in order])
+
+    msa_rank_df = pd.DataFrame(
+        {
+            "rank": np.arange(1, n + 1, dtype=int),
+            "id": [ids[i] for i in order],
+            "orig_index": [i + 1 for i in order],  # 1-based original position
+            "mean_pairwise_identity_pct": [float(mean_pid[i]) for i in order],
+            "identity_to_top1_pct": [float(pid_to_top1[i]) for i in order],
+        }
+    )
+
+    pid_df = pd.DataFrame(pid, index=ids, columns=ids)
+    pid_sorted = pid_df.iloc[order, order].copy()
+    pid_sorted.index = [ids[i] for i in order]
+    pid_sorted.columns = [ids[i] for i in order]
+
+    return msa_sorted, msa_rank_df, pid_sorted
+
+
+def msa_to_text(aln: MultipleSeqAlignment, fmt: str = "fasta") -> str:
+    buf = StringIO()
+    AlignIO.write(aln, buf, fmt)
+    return buf.getvalue()
+
+
+def msa_to_colored_html(
+    aln: MultipleSeqAlignment,
+    block_size: int | None = 80,   # set to None (or 0) for single-row-per-seq
+    max_id_chars: int = 36,
+    aa_colors: dict[str, str] | None = None,
+) -> str:
+    if aa_colors is None:
+        aa_colors = build_aa_color_map()
+
+    ids = [r.id[:max_id_chars] for r in aln]
+    seqs = [str(r.seq).upper().replace(".", "-") for r in aln]
+    if not seqs:
+        return "<div>No alignment available.</div>"
+
+    L = len(seqs[0])
+    name_w = min(max((len(i) for i in ids), default=0), max_id_chars)
+
+    def colored_segment(seg: str) -> str:
+        return "".join(
+            f'<span style="color:{aa_colors.get(_normalize_residue(ch), "#000")};">'
+            f"{html_lib.escape(ch)}</span>"
+            for ch in seg
+        )
+
+    lines: list[str] = []
+
+    # --- NEW: single-row mode (no wrapping; horizontal scroll) ---
+    if block_size is None or int(block_size) <= 0:
+        for sid, s in zip(ids, seqs):
+            sid_pad = sid.ljust(name_w)
+            lines.append(f"{html_lib.escape(sid_pad)}  {colored_segment(s)}")
+
+        pre = "\n".join(lines)
+        return f"""
+        <!doctype html>
+        <html>
+        <head><meta charset="utf-8"></head>
+        <body>
+          <div style="
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+            font-size: 12px;
+            line-height: 1.25;
+            white-space: pre;          /* do not wrap */
+            overflow-x: auto;          /* horizontal scroll */
+            overflow-y: auto;          /* vertical scroll */
+            overflow-wrap: normal;
+            word-break: normal;
+            height: 620px;
+            border: 1px solid #ddd;
+            padding: 10px;
+            ">
+{pre}
+          </div>
+        </body>
+        </html>
+        """
+
+    # --- Original block mode (wrapped into blocks) ---
+    for start in range(0, L, int(block_size)):
+        end = min(L, start + int(block_size))
+        for sid, s in zip(ids, seqs):
+            sid_pad = sid.ljust(name_w)
+            seg = s[start:end]
+            lines.append(f"{html_lib.escape(sid_pad)}  {colored_segment(seg)}")
+        lines.append("")
+
+    pre = "\n".join(lines)
+    return f"""
+    <!doctype html>
+    <html>
+    <head><meta charset="utf-8"></head>
+    <body>
+      <div style="
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+        font-size: 12px;
+        line-height: 1.25;
+        white-space: pre;
+        overflow: auto;
+        height: 620px;
+        border: 1px solid #ddd;
+        padding: 10px;
+        ">
+{pre}
+      </div>
+    </body>
+    </html>
+    """
+
+
+def plot_msa_heatmap_plotly(
+    aln: MultipleSeqAlignment,
+    title: str = "Top-50 nanobody MSA (ClustalW server; sorted by pairwise identity)",
+    aa_colors: dict[str, str] | None = None,
+) -> go.Figure:
+    if aa_colors is None:
+        aa_colors = build_aa_color_map()
+
+    ids = [r.id for r in aln]
+    seqs = [str(r.seq).upper().replace(".", "-") for r in aln]
+    if not seqs:
+        return go.Figure()
+
+    L = len(seqs[0])
+    cats = AA_CATEGORIES
+    cat_to_code = {c: i for i, c in enumerate(cats)}
+    K = len(cats)
+
+    Z = np.zeros((len(seqs), L), dtype=int)
+    T = np.empty((len(seqs), L), dtype=object)
+
+    for i, s in enumerate(seqs):
+        for j, ch in enumerate(s):
+            chn = _normalize_residue(ch)
+            Z[i, j] = cat_to_code.get(chn, cat_to_code["X"])
+            T[i, j] = chn
+
+    # Discrete colorscale
+    colorscale: list[tuple[float, str]] = []
+    for i, c in enumerate(cats):
+        col = aa_colors.get(c, "#000000")
+        colorscale.append((i / K, col))
+        colorscale.append(((i + 1) / K, col))
+
+    max_id_len = max((len(x) for x in ids), default=10)
+    left_margin = min(360, 9 * max_id_len + 40)
+
+    fig = go.Figure(
+        go.Heatmap(
+            z=Z,
+            x=list(range(1, L + 1)),
+            y=ids,
+            text=T,
+            hovertemplate="ID: %{y}<br>Align pos: %{x}<br>AA: %{text}<extra></extra>",
+            colorscale=colorscale,
+            zmin=-0.5,
+            zmax=K - 0.5,
+            showscale=False,
+        )
+    )
+    fig.update_yaxes(autorange="reversed", title="Nanobody (cluster_head)")
+    fig.update_xaxes(title="Alignment position")
+    fig.update_layout(
+        title=title,
+        height=max(520, 18 * len(ids) + 180),
+        margin=dict(l=left_margin, r=20, t=70, b=60),
+    )
+    return fig
+
+
+# -----------------------------
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # BARCODE FOLDER PARSING
-# -----------------------------
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def parse_barcode_label(folder_name: str) -> dict:
     name = folder_name.strip()
@@ -830,9 +1355,9 @@ def group_barcodes_by_target(barcodes: List[dict]) -> Dict[str, dict]:
     return groups
 
 
-# -----------------------------
+# ═══════════════════════════════════════════════════════════════════════════════
 # DATABASE
-# -----------------------------
+# ═══════════════════════════════════════════════════════════════════════════════
 
 DEFAULT_DB                   = "~/minion_nanobody.db"
 DEFAULT_START                = "ATGGCC"
@@ -893,6 +1418,17 @@ CREATE TABLE IF NOT EXISTS cluster_sequences (
   aa_length     INTEGER,
   PRIMARY KEY (run_id, target, cluster_head)
 );
+
+-- Pre-clustering unique AA sequences per barcode (for sticky sequence detection)
+CREATE TABLE IF NOT EXISTS raw_sequences (
+  run_id        TEXT,
+  target        TEXT,
+  barcode       TEXT,
+  aa_sequence   TEXT,
+  aa_length     INTEGER,
+  read_count    INTEGER,
+  PRIMARY KEY (run_id, target, barcode, aa_sequence)
+);
 """
 
 
@@ -913,9 +1449,9 @@ def sql_df(conn: sqlite3.Connection, sql: str, params=()) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-# -----------------------------
-# INGEST — whole run, one target at a time
-# -----------------------------
+# ═══════════════════════════════════════════════════════════════════════════════
+# INGEST — whole run, one target at a time using Test12.py pipeline
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def ingest_target(
     conn: sqlite3.Connection,
@@ -934,7 +1470,7 @@ def ingest_target(
     drop_unclustered: bool,
     progress_cb=None,
 ):
-    """Run pipeline for one target group and store results."""
+    """Run Test12.py pipeline for one target group and store results."""
     def log(msg):
         if progress_cb:
             progress_cb(f"  [{target}] {msg}")
@@ -970,23 +1506,23 @@ def ingest_target(
         cluster_tmp    = tmp_path / "mmseqs_tmp"
         cluster_tsv    = tmp_path / "clusters_cluster.tsv"
 
-        # Count reads
+        # Count reads (Test12.py)
         log("Counting reads...")
         total_reads_control  = count_fastq_records(control_files)
         total_reads_1xpanned = count_fastq_records(one_x_files)
         total_reads_2xpanned = count_fastq_records(two_x_files)
         log(f"control={total_reads_control:,}  1x={total_reads_1xpanned:,}  2x={total_reads_2xpanned:,}")
 
-        # Combine
+        # Combine (Test12.py)
         log("Combining FASTQs...")
         combine_fastqs(all_inputs, combined_fastq)
 
-        # Trim + translate 
+        # Trim + translate (Test12.py)
         log(f"Trimming (START={START}, END={END}) and translating...")
         kept5, discarded5 = trim_translate_fastq_to_fasta(combined_fastq, trimmed_fasta, START=START, END=END)
         log(f"Kept {kept5:,}, discarded {discarded5:,}")
 
-        # Filter
+        # Filter (Test12.py)
         log(f"Filtering (min AA length={LENGTH})...")
         kept6, discarded6 = filter_aa_fasta(trimmed_fasta, filtered_fasta, LENGTH=int(LENGTH))
         log(f"Kept {kept6:,}, discarded {discarded6:,}")
@@ -995,7 +1531,51 @@ def ingest_target(
             log("No sequences passed filtering — skipping. Check START/END anchors.")
             return
 
-        # Cluster 
+        # Store pre-clustering sequences for sticky sequence detection
+        log("Storing pre-clustering sequences...")
+        raw_seq_rows = []
+        # Parse filtered_fasta and map read_ids back to barcodes via cluster count method
+        # We store unique AA sequences per barcode using the combined filtered FASTA
+        # Since we have per-barcode FASTQ files, we re-translate them individually
+        barcode_raw_seqs: Dict[str, Dict[str, int]] = {}
+        all_lib_paths = {}
+        if control_dir: all_lib_paths["control"] = control_dir
+        if onex_dir:    all_lib_paths["1xpanned"] = onex_dir
+        if twox_dir:    all_lib_paths["2xpanned"] = twox_dir
+
+        for lib_id, lib_path in all_lib_paths.items():
+            seq_counts: Dict[str, int] = {}
+            for fq in find_fastq_files(lib_path):
+                opener = gzip.open(fq, "rt") if str(fq).endswith(".gz") else open(fq, "rt")
+                with opener as handle:
+                  for record in SeqIO.parse(handle, "fastq"):
+                    seq_str = str(record.seq).upper()
+                    start_idx = seq_str.find(START)
+                    end_idx = seq_str.find(END)
+                    if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
+                        continue
+                    sub = seq_str[start_idx: end_idx + len(END)]
+                    codon_len = (len(sub) // 3) * 3
+                    prot = str(Seq(sub[:codon_len]).translate(to_stop=False))
+                    if len(prot) < LENGTH or "*" in prot[:LENGTH]:
+                        continue
+                    seq_counts[prot] = seq_counts.get(prot, 0) + 1
+            barcode_raw_seqs[lib_id] = seq_counts
+
+        for lib_id, seq_counts in barcode_raw_seqs.items():
+            for aa_seq, count in seq_counts.items():
+                raw_seq_rows.append((run_id, target, lib_id, aa_seq, len(aa_seq), count))
+
+        with conn:
+            conn.executemany(
+                """INSERT OR REPLACE INTO raw_sequences
+                   (run_id, target, barcode, aa_sequence, aa_length, read_count)
+                   VALUES (?,?,?,?,?,?)""",
+                raw_seq_rows
+            )
+        log(f"  → {len(raw_seq_rows):,} unique barcode-sequence pairs stored")
+
+        # Cluster (Test12.py)
         mode_str = "easy-linclust" if use_linclust else "easy-cluster"
         log(f"Clustering with MMseqs2 {mode_str}...")
         run_mmseqs_easy_cluster(
@@ -1008,7 +1588,7 @@ def ingest_target(
             return
         log("Clustering complete")
 
-        # Count matrix 
+        # Count matrix (Test12.py)
         log("Building count matrix...")
         lib_paths = {"control": control_dir}
         if onex_dir:  lib_paths["1xpanned"] = onex_dir
@@ -1022,7 +1602,7 @@ def ingest_target(
             if col not in count_matrix.columns:
                 count_matrix[col] = 0
 
-        # Normalize 
+        # Normalize (Test12.py — exact formula)
         log("Normalizing...")
         count_matrix["control_norm"] = count_matrix["control"].astype(float).round(0).astype("Int64")
         if total_reads_control > 0 and total_reads_1xpanned > 0:
@@ -1047,7 +1627,7 @@ def ingest_target(
         n_clusters = len(count_matrix)
         log(f"{n_clusters:,} clusters")
 
-        # Get sequences
+        # Fetch sequences (Test12.py)
         log("Fetching AA sequences...")
         all_heads = count_matrix["cluster_head"].astype(str).tolist()
         seq_map = fetch_fasta_sequences_by_id(filtered_fasta, all_heads)
@@ -1100,12 +1680,15 @@ def ingest_run(
     use_linclust: bool,
     drop_unclustered: bool,
     ext_tg1_dir: Optional[Path] = None,
+    ext_overrides: Optional[Dict[str, Dict[str, Optional[Path]]]] = None,
+    skip_targets: List[str] = None,
     progress_cb=None,
 ) -> str:
     def log(msg):
         if progress_cb:
             progress_cb(msg)
 
+    skip_targets = skip_targets or []
     log("Scanning barcode folders...")
     barcodes = discover_barcodes(fastq_dir)
     if not barcodes:
@@ -1155,13 +1738,18 @@ def ingest_run(
 
     # Process each target
     for target, grp in sorted(groups.items()):
+        if target in skip_targets:
+            log(f"\nSkipping target: {target} (excluded by user)")
+            continue
         log(f"\nProcessing target: {target}")
         tg1_info = grp["tg1"]
         rounds   = grp["rounds"]
 
-        control_dir = Path(tg1_info["folder_path"]) if tg1_info else (ext_tg1_dir if ext_tg1_dir else None)
-        onex_dir    = Path(rounds[1]["folder_path"]) if 1 in rounds else None
-        twox_dir    = Path(rounds[2]["folder_path"]) if 2 in rounds else None
+        target_overrides = (ext_overrides or {}).get(target, {})
+        control_dir = Path(tg1_info["folder_path"]) if tg1_info else (
+            target_overrides.get("tg1") or (ext_tg1_dir if ext_tg1_dir else None))
+        onex_dir    = Path(rounds[1]["folder_path"]) if 1 in rounds else target_overrides.get("r1")
+        twox_dir    = Path(rounds[2]["folder_path"]) if 2 in rounds else target_overrides.get("r2")
 
         if not onex_dir and not twox_dir:
             log(f"  [{target}] No panning rounds found — skipping")
@@ -1185,9 +1773,89 @@ def ingest_run(
     return run_id
 
 
-# -----------------------------
+# ═══════════════════════════════════════════════════════════════════════════════
 # LOAD FROM DB
-# -----------------------------
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def find_sticky_sequences(
+    conn: sqlite3.Connection,
+    run_id: str,
+    target: str,
+    cluster_heads: List[str],
+    similarity_threshold: float = 1.0,
+) -> Dict[str, List[dict]]:
+    """
+    For each cluster_head sequence, check if it appears in raw_sequences
+    from ANY other run (regardless of target).
+    Returns {aa_sequence: [{"run_id": ..., "target": ..., "barcode": ..., "read_count": ...}, ...]}
+    Only sequences that appear in other runs are included.
+    similarity_threshold=1.0 means exact match (default).
+    """
+    if not cluster_heads:
+        return {}
+
+    # Get AA sequences for these cluster heads
+    placeholders = ",".join(["?"] * len(cluster_heads))
+    seqs_df = sql_df(conn,
+        f"SELECT cluster_head, aa_sequence FROM cluster_sequences WHERE run_id=? AND target=? AND cluster_head IN ({placeholders})",
+        (run_id, target, *cluster_heads))
+
+    if seqs_df.empty:
+        return {}
+
+    results: Dict[str, List[dict]] = {}
+
+    for _, row in seqs_df.iterrows():
+        aa_seq = row["aa_sequence"]
+        if not aa_seq:
+            continue
+
+        if similarity_threshold >= 1.0:
+            # Exact match
+            matches = sql_df(conn,
+                """SELECT run_id, target, barcode, read_count
+                   FROM raw_sequences
+                   WHERE aa_sequence=? AND run_id != ?""",
+                (aa_seq, run_id))
+        else:
+            # Approximate match using length filter as pre-screen
+            min_len = int(len(aa_seq) * similarity_threshold)
+            max_len = int(len(aa_seq) / similarity_threshold) + 1
+            candidates = sql_df(conn,
+                """SELECT run_id, target, barcode, aa_sequence, read_count
+                   FROM raw_sequences
+                   WHERE aa_length BETWEEN ? AND ? AND run_id != ?""",
+                (min_len, max_len, run_id))
+            if candidates.empty:
+                continue
+            # Filter by actual identity
+            def seq_identity(a: str, b: str) -> float:
+                matches = sum(ca == cb for ca, cb in zip(a, b))
+                return matches / max(len(a), len(b))
+            mask = candidates["aa_sequence"].apply(lambda s: seq_identity(aa_seq, s) >= similarity_threshold)
+            matches = candidates[mask][["run_id", "target", "barcode", "read_count"]]
+
+        if not matches.empty:
+            # Get sample_id for each run for readable display
+            run_ids = matches["run_id"].unique().tolist()
+            run_names = {}
+            for rid in run_ids:
+                r = conn.execute("SELECT sample_id FROM run WHERE run_id=?", (rid,)).fetchone()
+                run_names[rid] = r[0] if r else rid[:8]
+
+            hit_list = []
+            for _, m in matches.iterrows():
+                hit_list.append({
+                    "run_id": m["run_id"],
+                    "run_name": run_names.get(m["run_id"], m["run_id"][:8]),
+                    "target": m["target"],
+                    "barcode": m["barcode"],
+                    "read_count": int(m["read_count"]),
+                })
+            results[row["cluster_head"]] = hit_list
+
+    return results
+
 
 def load_count_matrix(conn: sqlite3.Connection, run_id: str, target: str) -> pd.DataFrame:
     counts = sql_df(conn,
@@ -1210,9 +1878,9 @@ def load_count_matrix(conn: sqlite3.Connection, run_id: str, target: str) -> pd.
     return result
 
 
-# -----------------------------
+# ═══════════════════════════════════════════════════════════════════════════════
 # STREAMLIT PAGES
-# -----------------------------
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def page_overview(conn: sqlite3.Connection):
     st.header("Overview")
@@ -1273,14 +1941,14 @@ def page_enrichment(conn: sqlite3.Connection):
         st.warning("No cluster counts found for this target.")
         return
 
-    # Use normalized counts
+    # Use normalized counts (Test12.py)
     count_matrix_for_plots = count_matrix.copy()
     for lib in ["control", "1xpanned", "2xpanned"]:
         norm_col = f"{lib}_norm"
         if norm_col in count_matrix_for_plots.columns:
             count_matrix_for_plots[lib] = pd.to_numeric(count_matrix_for_plots[norm_col], errors="coerce")
 
-    # Count matrix preview 
+    # Count matrix preview — add fold_enrichment column
     cm_display = count_matrix.copy()
     if "2xpanned_norm" in cm_display.columns and "control_norm" in cm_display.columns:
         cm_display["fold_enrichment"] = cm_display.apply(
@@ -1306,18 +1974,91 @@ def page_enrichment(conn: sqlite3.Connection):
                        f"{run_id[:8]}_{target}_count_matrix.csv", "text/csv")
 
 
-    # Top sequences
+    # Top sequences with sticky detection
     if show_sequences:
         st.subheader(f"Top {top_n} cluster amino-acid sequences")
+
+        # Similarity threshold for sticky detection
+        sticky_threshold = st.slider(
+            "Sticky sequence similarity threshold",
+            min_value=0.80, max_value=1.0, value=1.0, step=0.01,
+            format="%.2f",
+            help="1.0 = exact match only. Lower values catch near-identical sequences across runs.",
+            key=f"sticky_thresh_{run_id}_{target}"
+        )
+
         top_ids = count_matrix["cluster_head"].astype(str).head(top_n).tolist()
         placeholders = ",".join(["?"]*len(top_ids))
         seqs_df = sql_df(conn,
             f"SELECT cluster_head, aa_sequence, aa_length FROM cluster_sequences WHERE run_id=? AND target=? AND cluster_head IN ({placeholders})",
             (run_id, target, *top_ids))
+
         if not seqs_df.empty:
             seqs_df["_order"] = seqs_df["cluster_head"].map({ch: i for i, ch in enumerate(top_ids)})
             seqs_df = seqs_df.sort_values("_order").drop("_order", axis=1)
-            st.dataframe(seqs_df, use_container_width=True)
+
+            # Check for sticky sequences — cache in session state per run+target+threshold
+            sticky_cache_key = f"sticky_{run_id}_{target}_{sticky_threshold}"
+            other_runs = sql_df(conn, "SELECT run_id FROM run WHERE run_id != ?", (run_id,))
+            if not other_runs.empty:
+                if sticky_cache_key not in st.session_state:
+                    with st.spinner("Checking for sticky sequences across other runs..."):
+                        st.session_state[sticky_cache_key] = find_sticky_sequences(
+                            conn, run_id, target, top_ids,
+                            similarity_threshold=float(sticky_threshold)
+                        )
+                else:
+                    st.caption("Sticky sequences loaded from cache.")
+                sticky_map = st.session_state[sticky_cache_key]
+            else:
+                sticky_map = {}
+                st.caption("No other runs in database — sticky sequence detection skipped.")
+
+            # Build display dataframe with sticky info
+            display_rows = []
+            for _, row in seqs_df.iterrows():
+                ch = row["cluster_head"]
+                hits = sticky_map.get(ch, [])
+                is_sticky = len(hits) > 0
+                if hits:
+                    # Summarize: "run_name / target (barcode) x3 reads"
+                    hit_strs = []
+                    for h in hits:
+                        hit_strs.append(f"{h['run_name']} / {h['target']} ({h['barcode']}) — {h['read_count']} reads")
+                    appears_in = " | ".join(hit_strs)
+                    n_appearances = len(hits)
+                else:
+                    appears_in = ""
+                    n_appearances = 0
+
+                display_rows.append({
+                    "cluster_head": ch,
+                    "aa_sequence": row["aa_sequence"],
+                    "aa_length": row["aa_length"],
+                    "sticky": "⚠️ YES" if is_sticky else "",
+                    "appears_in": appears_in,
+                    "n_other_runs": n_appearances,
+                })
+
+            display_df = pd.DataFrame(display_rows)
+
+            # Highlight sticky rows red
+            def highlight_sticky(row):
+                if row.get("sticky") == "⚠️ YES":
+                    return ["background-color: #fce8e8; color: #666666"] * len(row)
+                return [""] * len(row)
+
+            n_sticky = display_df["sticky"].str.contains("YES", na=False).sum()
+            if n_sticky > 0:
+                st.warning(f"⚠️ {n_sticky} sticky sequence(s) found — highlighted in red")
+            else:
+                st.success("✅ No sticky sequences found in other runs")
+
+            st.dataframe(
+                display_df.style.apply(highlight_sticky, axis=1),
+                use_container_width=True
+            )
+
             fasta_text = seq_df_to_fasta_text(seqs_df)
             if fasta_text.strip():
                 clipboard_copy_button(fasta_text, label="Copy nanobody sequences (FASTA)",
@@ -1325,9 +2066,67 @@ def page_enrichment(conn: sqlite3.Connection):
                 with st.expander("FASTA text (manual copy fallback)"):
                     st.text_area("FASTA", value=fasta_text, height=220)
 
-    st.divider()
 
-    # Abundance distribution
+    st.divider()
+    # MSA panel (Test16.py)
+    with st.expander("Multiple sequence alignment — top 50 sequences (ClustalW server)", expanded=False):
+        st.caption("Submits top 50 sequences to EMBL-EBI ClustalW2. Requires internet and a valid email.")
+        RUN_MSA = st.checkbox("Run MSA", value=False, key=f"run_msa_{run_id}_{target}")
+        CLUSTALW_EMAIL = st.text_input("Email for EMBL-EBI submission (required)",
+                                        value="", disabled=not RUN_MSA,
+                                        key=f"msa_email_{run_id}_{target}")
+        MSA_SORT_MODE = st.selectbox("Sort sequences by",
+            ["Mean pairwise identity (desc)", "Identity to top-1 (desc)", "Server order"],
+            index=0, disabled=not RUN_MSA, key=f"msa_sort_{run_id}_{target}")
+
+        if RUN_MSA:
+            if not CLUSTALW_EMAIL.strip() or "@" not in CLUSTALW_EMAIL:
+                st.warning("Enter a valid email address to run ClustalW2.")
+            else:
+                top50_ids = count_matrix["cluster_head"].astype(str).head(50).tolist()
+                placeholders = ",".join(["?"]*len(top50_ids))
+                seqs50 = sql_df(conn,
+                    f"SELECT cluster_head, aa_sequence FROM cluster_sequences WHERE run_id=? AND target=? AND cluster_head IN ({placeholders})",
+                    (run_id, target, *top50_ids))
+                if seqs50.empty or len(seqs50) < 2:
+                    st.info("Need at least 2 sequences for alignment.")
+                else:
+                    seqs50["_order"] = seqs50["cluster_head"].map({ch: i for i, ch in enumerate(top50_ids)})
+                    seqs50 = seqs50.sort_values("_order").drop("_order", axis=1)
+                    fasta_in = seq_df_to_fasta_text(seqs50)
+                    try:
+                        with st.spinner("Submitting to ClustalW2 server..."):
+                            aln_result = clustalw2_align_via_ebi(
+                                fasta_text=fasta_in,
+                                email=CLUSTALW_EMAIL.strip(),
+                                stype="protein",
+                            )
+                        aln_text = (aln_result.get("aln_fasta", "") or "").strip() or (aln_result.get("aln_clustal", "") or "").strip()
+                        msa = parse_msa_auto(aln_text)
+                        msa_sorted, msa_rank_df, pid_sorted = sort_msa_by_pairwise(msa, mode=MSA_SORT_MODE)
+
+                        tabs = st.tabs(["Alignment viewer", "Pairwise identity", "Raw ClustalW output"])
+                        with tabs[0]:
+                            fig_msa = plot_msa_heatmap_plotly(msa_sorted)
+                            st.plotly_chart(fig_msa, use_container_width=True)
+                            with st.expander("Colored alignment text (scroll)", expanded=False):
+                                msa_html = msa_to_colored_html(msa_sorted, block_size=None)
+                                components.html(msa_html, height=660, scrolling=True)
+                        with tabs[1]:
+                            st.dataframe(msa_rank_df, use_container_width=True)
+                            with st.expander("Full pairwise identity matrix"):
+                                st.dataframe(pid_sorted, use_container_width=True)
+                        with tabs[2]:
+                            raw = aln_result.get("aln_clustal", "").strip()
+                            if raw:
+                                st.code(raw, language="text")
+                            else:
+                                st.info("No CLUSTAL-formatted output returned (FASTA alignment was used).")
+                    except Exception as e:
+                        st.error(f"MSA failed: {e}")
+
+
+    # Abundance distribution (Test12.py)
     st.subheader("Abundance distribution by library")
     cluster_counts_long = sql_df(conn,
         "SELECT library_id, cluster_head, raw_count as n FROM cluster_counts WHERE run_id=? AND target=?",
@@ -1350,7 +2149,7 @@ def page_enrichment(conn: sqlite3.Connection):
     # Determine condition libs (may only have 1xpanned if no R2)
     condition_libs = [c for c in ["1xpanned", "2xpanned"] if c in count_matrix_for_plots.columns and count_matrix_for_plots[c].sum() > 0]
 
-    # Interactive Plotly scatter 
+    # Interactive Plotly scatter (Test12.py)
     st.subheader("Differential abundance")
     diff_fig_plotly = plot_abundance_vs_differential_plotly(
         count_matrix=count_matrix_for_plots,
@@ -1391,10 +2190,12 @@ def page_enrichment(conn: sqlite3.Connection):
 
 def page_ingest(conn: sqlite3.Connection, db_path: Path):
     st.header("Ingest Run")
+    if "skip_targets" not in st.session_state:
+        st.session_state["skip_targets"] = []
     st.caption("Point to a run folder — the app auto-detects all targets and processes each one.")
 
     folder_path = st.text_input("Path to run folder",
-                                 placeholder="/Users/your_username/Downloads/run5")
+                                 placeholder="/Users/ishanghosh/Downloads/run5")
 
     if folder_path.strip():
         p = Path(folder_path.strip()).expanduser()
@@ -1410,6 +2211,20 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
                     r2  = grp["rounds"].get(2, {}).get("label", "—")
                     preview_rows.append({"target": target, "TG1 (control)": tg1, "R1 (1xpanned)": r1, "R2 (2xpanned)": r2})
                 st.dataframe(pd.DataFrame(preview_rows), use_container_width=True)
+
+                # Target skip checkboxes
+                st.caption("Uncheck any targets you want to skip:")
+                skip_targets = []
+                cols = st.columns(min(4, len(groups)))
+                for idx, t in enumerate(sorted(groups.keys())):
+                    with cols[idx % len(cols)]:
+                        if not st.checkbox(t, value=True, key=f"ingest_target_{t}"):
+                            skip_targets.append(t)
+                if skip_targets:
+                    st.warning(f"Will skip: {', '.join(skip_targets)}")
+                else:
+                    st.session_state["skip_targets"] = []
+                st.session_state["skip_targets"] = skip_targets
             else:
                 st.error("No barcode folders found.")
         else:
@@ -1423,60 +2238,105 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
 
     with st.expander("MMseqs2 parameters"):
         use_linclust  = st.checkbox("Use easy-linclust (fast) instead of easy-cluster",
-                                    value=False)
+                                    value=False,
+                                    help="easy-cluster matches Test12.py exactly. easy-linclust is ~10x faster.")
         mm_min_seq_id = st.number_input("min_seq_id", 0.0, 1.0, 0.90, 0.01, format="%.2f")
         mm_coverage   = st.number_input("coverage",   0.0, 1.0, 0.90, 0.01, format="%.2f")
         mm_cov_mode   = st.number_input("cov_mode",   0, 5, 0, 1)
 
-    # External TG1 selector
+    # ── External library overrides ──────────────────────────────────────────────
     st.divider()
-    st.subheader("External TG1 (optional)")
-    st.caption("Use this if the run has no TG1 barcode and TG1 comes from a different run.")
+    st.subheader("External library overrides (optional)")
+    st.caption(
+        "For any missing TG1, R1, or R2 in a target group, you can supply a barcode folder "
+        "from an already-ingested run or provide a direct folder path."
+    )
 
-    ext_tg1_dir = None
-    ext_tg1_source = st.radio("TG1 source", ["None", "Already ingested run", "Folder path"],
-                               horizontal=True, key="ext_tg1_source")
-
-    if ext_tg1_source == "Already ingested run":
-        other_runs = sql_df(conn, "SELECT run_id, sample_id FROM run ORDER BY ingested_at DESC")
-        if not other_runs.empty:
-            sel_run = st.selectbox("Source run",
+    # Build a helper widget that returns a Path or None for a given slot
+    def library_selector(label: str, key_prefix: str) -> Optional[Path]:
+        source = st.radio(
+            f"{label} source",
+            ["None", "Already ingested run", "Folder path"],
+            horizontal=True,
+            key=f"{key_prefix}_source",
+        )
+        if source == "Already ingested run":
+            other_runs = sql_df(conn, "SELECT run_id, sample_id FROM run ORDER BY ingested_at DESC")
+            if other_runs.empty:
+                st.info("No runs ingested yet.")
+                return None
+            sel_run = st.selectbox(
+                "Source run",
                 other_runs["run_id"].tolist(),
-                format_func=lambda r: other_runs[other_runs["run_id"]==r]["sample_id"].iloc[0],
-                key="ext_tg1_run")
-            tg1_paths = sql_df(conn,
-                "SELECT DISTINCT control_path FROM target_run WHERE run_id=? AND control_path IS NOT NULL AND LOWER(control_path) LIKE '%tg1%'",
-                (sel_run,))
-            if not tg1_paths.empty:
-                path_options = tg1_paths["control_path"].tolist()
-                path_labels = [Path(p).name for p in path_options]
-                sel_idx = st.selectbox("TG1 barcode folder",
-                    range(len(path_labels)),
-                    format_func=lambda i: path_labels[i],
-                    key="ext_tg1_bc_sel")
-                ext_tg1_dir = Path(path_options[sel_idx])
-                st.caption(f"Path: `{ext_tg1_dir}`")
-            else:
-                st.info("No TG1 barcodes found in that run.")
-        else:
-            st.info("No runs ingested yet.")
+                format_func=lambda r: other_runs[other_runs["run_id"] == r]["sample_id"].iloc[0],
+                key=f"{key_prefix}_run",
+            )
+            # Get all barcode folders stored for that run
+            all_paths = sql_df(conn,
+                """SELECT DISTINCT control_path as path FROM target_run WHERE run_id=? AND control_path IS NOT NULL
+                   UNION
+                   SELECT DISTINCT onex_path   as path FROM target_run WHERE run_id=? AND onex_path IS NOT NULL
+                   UNION
+                   SELECT DISTINCT twox_path   as path FROM target_run WHERE run_id=? AND twox_path IS NOT NULL""",
+                (sel_run, sel_run, sel_run))
+            if all_paths.empty:
+                st.info("No barcode folders found for that run.")
+                return None
+            path_options = all_paths["path"].tolist()
+            path_labels  = [Path(p).name for p in path_options]
+            sel_idx = st.selectbox(
+                "Barcode folder",
+                range(len(path_labels)),
+                format_func=lambda i: path_labels[i],
+                key=f"{key_prefix}_bc",
+            )
+            chosen = Path(path_options[sel_idx])
+            st.caption(f"`{chosen}`")
+            return chosen
+        elif source == "Folder path":
+            raw = st.text_input(
+                f"{label} folder path",
+                placeholder="/Users/ishanghosh/Downloads/run5/barcode06_P-aer_llama_TG1",
+                key=f"{key_prefix}_path",
+            )
+            if raw.strip():
+                resolved = Path(raw.strip()).expanduser()
+                if resolved.exists():
+                    st.success(f"Found: `{resolved}`")
+                    return resolved
+                else:
+                    st.error("Path does not exist.")
+        return None
 
-    elif ext_tg1_source == "Folder path":
-        tg1_path_input = st.text_input("TG1 barcode folder path",
-            placeholder="/Users/your_username/Downloads/run5/barcode06_P-aer_llama_TG1",
-            key="ext_tg1_path")
-        if tg1_path_input.strip():
-            resolved = Path(tg1_path_input.strip()).expanduser()
-            if resolved.exists():
-                st.success(f"Found: `{resolved}`")
-                ext_tg1_dir = resolved
-            else:
-                st.error("Path does not exist.")
+    # Show override widgets only for targets that are missing one or more slots
+    ext_overrides: Dict[str, Dict[str, Optional[Path]]] = {}  # {target: {slot: path}}
 
-    if ext_tg1_dir:
-        st.info(f"External TG1 will be used for targets with no TG1 barcode: `{ext_tg1_dir.name}`")
+    if folder_path.strip():
+        p_check = Path(folder_path.strip()).expanduser()
+        if p_check.exists():
+            barcodes_check = discover_barcodes(p_check)
+            if barcodes_check:
+                groups_check = group_barcodes_by_target(barcodes_check)
+                missing_targets = {
+                    t: g for t, g in groups_check.items()
+                    if g["tg1"] is None or 1 not in g["rounds"] or 2 not in g["rounds"]
+                }
+                if missing_targets:
+                    for target, grp in sorted(missing_targets.items()):
+                        with st.expander(f"⚠️  {target} — missing libraries"):
+                            ext_overrides[target] = {}
+                            if grp["tg1"] is None:
+                                st.markdown("**TG1 (control) — not found in run folder**")
+                                ext_overrides[target]["tg1"] = library_selector("TG1", f"{target}_tg1")
+                            if 1 not in grp["rounds"]:
+                                st.markdown("**R1 (1xpanned) — not found in run folder**")
+                                ext_overrides[target]["r1"] = library_selector("R1", f"{target}_r1")
+                            if 2 not in grp["rounds"]:
+                                st.markdown("**R2 (2xpanned) — not found in run folder**")
+                                ext_overrides[target]["r2"] = library_selector("R2", f"{target}_r2")
+                else:
+                    st.success("All targets have complete TG1 / R1 / R2 — no overrides needed.")
 
-    st.divider()
     if st.button("Start Ingest", type="primary", disabled=not folder_path.strip()):
         p = Path(folder_path.strip()).expanduser()
         if not p.exists():
@@ -1496,10 +2356,16 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
                 mm_cov_mode=int(mm_cov_mode),
                 use_linclust=bool(use_linclust),
                 drop_unclustered=bool(drop_unclustered),
-                ext_tg1_dir=ext_tg1_dir,
+                ext_tg1_dir=None,
+                ext_overrides=ext_overrides,
+                skip_targets=list(st.session_state.get("skip_targets", [])),
                 progress_cb=log,
             )
             st.success(f"✅ Ingest complete! Run ID: `{run_id}`")
+            # Clear sticky sequence cache — new run may affect results for all targets
+            for k in list(st.session_state.keys()):
+                if k.startswith("sticky_"):
+                    del st.session_state[k]
         except Exception as e:
             st.error(f"Ingest failed: {e}")
 
@@ -1524,13 +2390,13 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
             st.rerun()
 
 
-# -----------------------------
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
-# -----------------------------
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    st.set_page_config(page_title="MinION Nanobody Analysis", layout="wide")
-    st.title("MinION Nanobody Analysis")
+    st.set_page_config(page_title="MinION Nanobody Analysis v2", layout="wide")
+    st.title("MinION Nanobody Analysis v2")
 
     db_path = Path(DEFAULT_DB).expanduser()
     conn = connect_db(db_path)
