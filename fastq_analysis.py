@@ -2426,7 +2426,7 @@ def page_enrichment(conn: sqlite3.Connection):
     # Determine condition libs (may only have 1xpanned if no R2)
     condition_libs = [c for c in ["1xpanned", "2xpanned"] if c in count_matrix_for_plots.columns and count_matrix_for_plots[c].sum() > 0]
 
-    # Interactive Plotly scatter (Test12.py)
+    # Interactive Plotly scatter 
     st.subheader("Differential abundance")
     diff_fig_plotly = plot_abundance_vs_differential_plotly(
         count_matrix=count_matrix_for_plots,
