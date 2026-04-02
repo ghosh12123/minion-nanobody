@@ -1,5 +1,5 @@
 """
-MinION Nanobody Analysis 
+MinION Nanobody Analysis
 """
 
 import gzip
@@ -35,6 +35,7 @@ from Bio.Align import MultipleSeqAlignment
 from Bio.SeqRecord import SeqRecord
 import matplotlib.colors as mcolors
 from plotly.subplots import make_subplots
+
 
 # -----------------------------
 # Helpers (folders / names)
@@ -576,7 +577,8 @@ def plot_abundance_vs_differential(
     for ax, cond2 in zip(axes, condition_libs):
         d = plot_data_diff[plot_data_diff["condition2"] == cond2]
 
-        ax.axvline(np.log10(float(baseline_threshold)), color="gray")
+        if float(baseline_threshold) > 0:
+            ax.axvline(np.log10(float(baseline_threshold)), color="gray")
         ax.axhline(np.log10(float(enrichment_threshold)), color="gray")
 
         d0 = d[~d["highlight"]]
@@ -640,7 +642,7 @@ def plot_abundance_vs_differential(
     return fig, plot_data_diff
 
 
-# Plotly version for interactive hover (ID + AA sequence)
+# NEW: Plotly version for interactive hover (ID + AA sequence)
 def plot_abundance_vs_differential_plotly(
     count_matrix: pd.DataFrame,
     baseline_lib: str,
@@ -711,7 +713,7 @@ def plot_abundance_vs_differential_plotly(
         horizontal_spacing=0.08,
     )
 
-    x_vline = np.log10(float(baseline_threshold))
+    x_vline = np.log10(float(baseline_threshold)) if float(baseline_threshold) > 0 else None
     y_hline = np.log10(float(enrichment_threshold))
 
     # Hover: show ID + AA sequence (plus numeric context)
@@ -763,9 +765,10 @@ def plot_abundance_vs_differential_plotly(
 
         add_scatter(d0, "black", 5, "not significant", showlegend=(i == 1))
         add_scatter(d_blue, "blue", 9, "sig in 1xpanned (blue)", showlegend=(i == 1))
-        add_scatter(d_red, "darkred", 9, "sig in 2xpanned (red)", showlegend=(i == 1))
+        add_scatter(d_red, "darkred", 9, "sig in 2xpanned (red)", showlegend=(i == len(condition_libs)))
 
-        fig.add_vline(x=x_vline, line_color="gray", line_width=1, row=1, col=i)
+        if x_vline is not None:
+            fig.add_vline(x=x_vline, line_color="gray", line_width=1, row=1, col=i)
         fig.add_hline(y=y_hline, line_color="gray", line_width=1, row=1, col=i)
 
         fig.update_xaxes(
@@ -802,7 +805,7 @@ def plot_abundance_vs_differential_plotly(
 # -----------------------------
 
 
-# ClustalW (EMBL-EBI server) + MSA sorting + colored display
+# NEW: ClustalW (EMBL-EBI server) + MSA sorting + colored display
 # -----------------------------
 EBI_REST_ROOT = "https://www.ebi.ac.uk/Tools/services/rest"
 CLUSTALW_SERVICE = "clustalw2"
@@ -1183,7 +1186,7 @@ def msa_to_colored_html(
 
     lines: list[str] = []
 
-    # single-row mode (no wrapping; horizontal scroll) ---
+    # --- NEW: single-row mode (no wrapping; horizontal scroll) ---
     if block_size is None or int(block_size) <= 0:
         for sid, s in zip(ids, seqs):
             sid_pad = sid.ljust(name_w)
@@ -2112,7 +2115,7 @@ def page_enrichment(conn: sqlite3.Connection):
 
     col1, col2 = st.columns(2)
     with col1:
-        baseline_threshold = st.number_input("Baseline threshold", min_value=1,
+        baseline_threshold = st.number_input("Baseline threshold", min_value=0,
                                               value=DEFAULT_BASELINE_THRESHOLD, step=1)
     with col2:
         enrichment_threshold = st.number_input("Enrichment threshold (fold)", min_value=0.0001,
@@ -2276,7 +2279,7 @@ def page_enrichment(conn: sqlite3.Connection):
 
 
     st.divider()
-    # MSA panel
+    # MSA panel 
     with st.expander("Multiple sequence alignment (ClustalW server)", expanded=False):
         st.caption("Submits sequences to EMBL-EBI ClustalW2. Requires internet and a valid email.")
         RUN_MSA = st.checkbox("Run MSA", value=False, key=f"run_msa_{run_id}_{target}")
@@ -2403,7 +2406,7 @@ def page_enrichment(conn: sqlite3.Connection):
                         st.error(f"MSA failed: {e}")
 
 
-    # Abundance distribution 
+    # Abundance distribution
     st.subheader("Abundance distribution by library")
     cluster_counts_long = sql_df(conn,
         "SELECT library_id, cluster_head, raw_count as n FROM cluster_counts WHERE run_id=? AND target=?",
