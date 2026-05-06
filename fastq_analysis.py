@@ -1,5 +1,5 @@
 """
-MinION Nanobody Analysis
+MinION Nanobody Analysis 
 """
 
 import gzip
@@ -144,6 +144,11 @@ def describe_file_for_log(p: Path) -> str:
 # FASTQ helpers
 # -----------------------------
 def find_fastq_files(dir_path: Path) -> list[Path]:
+    """Find FASTQ files in a directory, or return the file itself if it's a FASTQ file."""
+    dir_path = Path(dir_path)
+    # Flat layout — path points directly to a FASTQ file
+    if dir_path.is_file():
+        return [dir_path]
     pats = [".fastq", ".fq", ".fastq.gz", ".fq.gz"]
     files: list[Path] = []
     for pat in pats:
@@ -1187,7 +1192,7 @@ def msa_to_colored_html(
 
     lines: list[str] = []
 
-    # --- single-row mode (no wrapping; horizontal scroll) ---
+    # Single-row mode (no wrapping; horizontal scroll)
     if block_size is None or int(block_size) <= 0:
         for sid, s in zip(ids, seqs):
             sid_pad = sid.ljust(name_w)
@@ -1361,21 +1366,50 @@ def parse_barcode_label(folder_name: str) -> dict:
 
 
 def discover_barcodes(folder: Path) -> List[dict]:
-    """Discover all barcode folders in a run directory."""
+    """
+    Discover all barcode folders or FASTQ files in a run directory.
+    Supports two layouts:
+      1. Subfolders per barcode: barcode13_CD98_TG1/reads.fastq.gz  (standard)
+      2. Flat FASTQ files:       barcode13_CD98_TG1.fastq.gz        (Matthias-style)
+    """
     results = []
     scan_dir = folder / "fastq_pass" if (folder / "fastq_pass").exists() else folder
-    for d in sorted(scan_dir.iterdir()):
-        if not d.is_dir() or "unclassified" in d.name.lower():
+
+    for item in sorted(scan_dir.iterdir()):
+        if "unclassified" in item.name.lower():
             continue
-        meta = parse_barcode_label(d.name)
-        if not meta:
-            continue
-        files = find_fastq_files(d)
-        if not files:
-            continue
-        meta["files"] = files
-        meta["folder_path"] = str(d.resolve())
-        results.append(meta)
+
+        if item.is_dir():
+            # Standard layout — barcode subfolder
+            meta = parse_barcode_label(item.name)
+            if not meta:
+                continue
+            files = find_fastq_files(item)
+            if not files:
+                continue
+            meta["files"] = files
+            meta["folder_path"] = str(item.resolve())
+            results.append(meta)
+
+        elif item.is_file() and (item.suffix in (".gz", ".fastq") or item.name.endswith(".fastq.gz")):
+            # Flat layout — FASTQ file named like a barcode
+            # Strip extensions to get the barcode name
+            name = item.name
+            for ext in (".fastq.gz", ".fastq", ".gz"):
+                if name.endswith(ext):
+                    name = name[:-len(ext)]
+                    break
+            meta = parse_barcode_label(name)
+            if not meta:
+                continue
+            # Create a virtual folder path pointing to the file's parent
+            # but store the file directly so find_fastq_files works
+            virtual_dir = item.parent / name
+            meta["files"] = [item]
+            meta["folder_path"] = str(item.resolve())
+            meta["flat_file"] = True  # flag for find_fastq_files compatibility
+            results.append(meta)
+
     return results
 
 
@@ -1562,7 +1596,7 @@ def sql_df(conn: sqlite3.Connection, sql: str, params=()) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# INGEST — whole run, one target at a time 
+# INGEST 
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _compute_target(args: dict) -> dict:
@@ -2548,7 +2582,7 @@ def page_enrichment(conn: sqlite3.Connection):
         st.warning("No cluster counts found for this target.")
         return
 
-    # Use normalized counts
+    # Use normalized counts 
     count_matrix_for_plots = count_matrix.copy()
     for lib in ["control", "1xpanned", "2xpanned"]:
         norm_col = f"{lib}_norm"
