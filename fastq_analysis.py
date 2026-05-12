@@ -37,7 +37,6 @@ from Bio.SeqRecord import SeqRecord
 import matplotlib.colors as mcolors
 from plotly.subplots import make_subplots
 
-
 # -----------------------------
 # Helpers (folders / names)
 # -----------------------------
@@ -1192,7 +1191,7 @@ def msa_to_colored_html(
 
     lines: list[str] = []
 
-    # Single-row mode (no wrapping; horizontal scroll)
+    # Single-row mode (no wrapping; horizontal scroll) 
     if block_size is None or int(block_size) <= 0:
         for sid, s in zip(ids, seqs):
             sid_pad = sid.ljust(name_w)
@@ -1596,7 +1595,7 @@ def sql_df(conn: sqlite3.Connection, sql: str, params=()) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# INGEST 
+# INGEST — whole run, one target at a time 
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _compute_target(args: dict) -> dict:
@@ -1932,6 +1931,7 @@ def ingest_run(
     ext_tg1_dir: Optional[Path] = None,
     ext_overrides: Optional[Dict[str, Dict[str, Optional[Path]]]] = None,
     skip_targets: List[str] = None,
+    max_workers: int = None,
     progress_cb=None,
 ) -> str:
     def log(msg):
@@ -2018,9 +2018,13 @@ def ingest_run(
         conn.close()
         return run_id
 
-    # Run targets in parallel — use min(n_targets, cpu_count-1) workers
-    n_workers = min(len(target_args), max(1, (os.cpu_count() or 2) - 1))
-    log(f"\nProcessing {len(target_args)} target(s) in parallel ({n_workers} workers)...")
+    # Run targets in parallel — use min(n_targets, max_workers) workers
+    default_workers = max(1, (os.cpu_count() or 2) - 1)
+    n_workers = min(len(target_args), max_workers if max_workers is not None else default_workers)
+    if n_workers == 1:
+        log(f"\nProcessing {len(target_args)} target(s) sequentially...")
+    else:
+        log(f"\nProcessing {len(target_args)} target(s) in parallel ({n_workers} workers)...")
 
     if n_workers == 1 or len(target_args) == 1:
         # Single target — run directly (no multiprocessing overhead)
@@ -2582,7 +2586,7 @@ def page_enrichment(conn: sqlite3.Connection):
         st.warning("No cluster counts found for this target.")
         return
 
-    # Use normalized counts 
+    # Use normalized counts
     count_matrix_for_plots = count_matrix.copy()
     for lib in ["control", "1xpanned", "2xpanned"]:
         norm_col = f"{lib}_norm"
@@ -3096,6 +3100,13 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
     LENGTH = st.number_input("Minimum amino-acid length", min_value=1, value=DEFAULT_LENGTH, step=1)
     drop_unclustered = st.checkbox("Drop reads not in cluster TSV (recommended)", value=True)
 
+    run_sequentially = st.checkbox(
+        "Run targets sequentially (1 worker)",
+        value=False,
+        help="Use this if you experience crashes or out-of-memory errors. Large datasets can exhaust RAM when multiple targets run simultaneously."
+    )
+    max_workers = 1 if run_sequentially else (os.cpu_count() or 2) - 1
+
     with st.expander("MMseqs2 parameters"):
         use_linclust  = st.checkbox("Use easy-linclust (fast) instead of easy-cluster",
                                     value=False)
@@ -3196,6 +3207,59 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
                 else:
                     st.success("All targets have complete TG1 / R1 / R2 — no overrides needed.")
 
+    # Final preview table — reflects skips and overrides
+    if folder_path.strip() and 'groups' in dir():
+        pass  # groups already in scope from preview section above
+    if folder_path.strip():
+        try:
+            _p = Path(folder_path.strip()).expanduser()
+            if _p.exists():
+                _barcodes = discover_barcodes(_p)
+                _groups = group_barcodes_by_target(_barcodes)
+                _skip = list(st.session_state.get("skip_targets", []))
+                _global_tg1 = next((bc for bc in _barcodes if bc.get("round") == 0 and bc.get("target","").upper() == "TG1"), None)
+
+                final_rows = []
+                for tgt, grp in sorted(_groups.items()):
+                    if tgt in _skip:
+                        continue
+                    tg1_bc = grp["tg1"]
+                    rounds = grp["rounds"]
+                    _ov = ext_overrides.get(tgt, {}) if 'ext_overrides' in dir() else {}
+
+                    tg1_path = (
+                        tg1_bc["folder_path"] if tg1_bc else
+                        str(_ov.get("tg1") or "") or
+                        (str(ext_tg1_path) if 'ext_tg1_path' in dir() and ext_tg1_path else "— (no TG1)")
+                    )
+                    r1_path = (
+                        rounds[1]["folder_path"] if 1 in rounds else
+                        str(_ov.get("r1") or "") or "—"
+                    )
+                    r2_path = (
+                        rounds[2]["folder_path"] if 2 in rounds else
+                        str(_ov.get("r2") or "") or "—"
+                    )
+
+                    def _short(p):
+                        if not p or p in ("—", "— (no TG1)"):
+                            return p
+                        return Path(p).name
+
+                    final_rows.append({
+                        "target": tgt,
+                        "TG1 (control)": _short(tg1_path),
+                        "R1 (1xpanned)": _short(r1_path),
+                        "R2 (2xpanned)": _short(r2_path),
+                    })
+
+                if final_rows:
+                    st.subheader("Final ingest plan")
+                    st.caption("This is exactly what will be ingested. Reflects any skipped targets and library overrides.")
+                    st.dataframe(pd.DataFrame(final_rows), use_container_width=True)
+        except Exception:
+            pass
+
     if st.button("Start Ingest", type="primary", disabled=not folder_path.strip()):
         p = Path(folder_path.strip()).expanduser()
         if not p.exists():
@@ -3218,6 +3282,7 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
                 ext_tg1_dir=None,
                 ext_overrides=ext_overrides,
                 skip_targets=list(st.session_state.get("skip_targets", [])),
+                max_workers=int(max_workers),
                 progress_cb=log,
             )
             st.success(f"✅ Ingest complete! Run ID: `{run_id}`")
@@ -3264,7 +3329,28 @@ def main():
     st.set_page_config(page_title="MinION Nanobody Analysis", layout="wide")
     st.title("MinION Nanobody Analysis")
 
-    db_path = Path(DEFAULT_DB).expanduser()
+    # Database path selector
+    if "db_path_str" not in st.session_state:
+        st.session_state["db_path_str"] = str(Path(DEFAULT_DB).expanduser())
+
+    with st.sidebar.expander("Database", expanded=False):
+        db_input = st.text_input(
+            "Database path",
+            value=st.session_state["db_path_str"],
+            help="Path to the .db file. Change this to point to a different database.",
+            key="db_path_input"
+        )
+        if st.button("Switch database", key="switch_db"):
+            p = Path(db_input.strip()).expanduser()
+            if not p.parent.exists():
+                st.error(f"Directory does not exist: {p.parent}")
+            else:
+                st.session_state["db_path_str"] = str(p)
+                st.success(f"Switched to: {p.name}")
+                st.rerun()
+        st.caption(f"Active: `{Path(st.session_state['db_path_str']).name}`")
+
+    db_path = Path(st.session_state["db_path_str"]).expanduser()
     conn = connect_db(db_path)
 
     page = st.sidebar.radio("Page", ["Overview", "Enrichment", "Sticky Sequences", "Ingest"])
