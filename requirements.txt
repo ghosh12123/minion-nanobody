@@ -1,7 +1,8 @@
-streamlit
-biopython
-plotly
-pandas
-numpy
-matplotlib
-requests
+streamlit 
+biopython 
+plotly 
+pandas 
+numpy 
+matplotlib 
+requests 
+reportlab
