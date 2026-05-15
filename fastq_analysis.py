@@ -1,5 +1,5 @@
 """
-MinION Nanobody Analysis 
+MinION Nanobody Analysis
 """
 
 import gzip
@@ -36,6 +36,7 @@ from Bio.Align import MultipleSeqAlignment
 from Bio.SeqRecord import SeqRecord
 import matplotlib.colors as mcolors
 from plotly.subplots import make_subplots
+
 
 # -----------------------------
 # Helpers (folders / names)
@@ -1595,7 +1596,7 @@ def sql_df(conn: sqlite3.Connection, sql: str, params=()) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# INGEST — whole run, one target at a time 
+# INGEST — whole run, one target at a time using Test12.py pipeline
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _compute_target(args: dict) -> dict:
@@ -2272,6 +2273,7 @@ def page_sticky(conn: sqlite3.Connection):
     summary = (df.groupby(["run_name", "target", "cluster_head"])
                .agg(n_runs=("found_in_run_id", "nunique"),
                     n_appearances=("found_in_run_id", "count"),
+                    aa_sequence=("aa_sequence", "first"),
                     aa_length=("aa_length", "first"))
                .reset_index()
                .sort_values("n_runs", ascending=False))
@@ -2535,16 +2537,25 @@ def page_enrichment(conn: sqlite3.Connection):
         st.info("No runs ingested yet.")
         return
 
+    run_ids = runs["run_id"].tolist()
+    saved_run = st.session_state.get("enrichment_run_id")
+    default_run_idx = run_ids.index(saved_run) if saved_run in run_ids else 0
     run_id = st.selectbox("Run",
-        runs["run_id"].tolist(),
+        run_ids,
+        index=default_run_idx,
         format_func=lambda r: runs[runs["run_id"]==r]["sample_id"].iloc[0])
+    st.session_state["enrichment_run_id"] = run_id
 
     targets_df = sql_df(conn, "SELECT target FROM target_run WHERE run_id=? ORDER BY target", (run_id,))
     if targets_df.empty:
         st.warning("No targets found for this run.")
         return
 
-    target = st.selectbox("Target", targets_df["target"].tolist())
+    target_list = targets_df["target"].tolist()
+    saved_target = st.session_state.get("enrichment_target")
+    default_target_idx = target_list.index(saved_target) if saved_target in target_list else 0
+    target = st.selectbox("Target", target_list, index=default_target_idx)
+    st.session_state["enrichment_target"] = target
 
     # Show ingest parameters for this run
     run_params = sql_df(conn,
@@ -2586,7 +2597,7 @@ def page_enrichment(conn: sqlite3.Connection):
         st.warning("No cluster counts found for this target.")
         return
 
-    # Use normalized counts
+    # Use normalized counts 
     count_matrix_for_plots = count_matrix.copy()
     for lib in ["control", "1xpanned", "2xpanned"]:
         norm_col = f"{lib}_norm"
@@ -2746,16 +2757,18 @@ def page_enrichment(conn: sqlite3.Connection):
                     for h in hits
                 ]) if hits else ""
 
-                row_dict = {"cluster_head": ch}
                 if show_aa:
-                    row_dict["sticky"] = "⚠️ YES" if is_sticky else ""
-                    row_dict["appears_in"] = appears_in
-                    row_dict["n_other_runs"] = len(hits)
-                    row_dict["aa_sequence"] = aa_seq
-                    row_dict["aa_length"] = aa_len
+                    row_dict = {
+                        "cluster_head": ch,
+                        "aa_sequence": aa_seq,
+                        "aa_length": aa_len,
+                    }
                 else:
-                    row_dict["nt_sequence"] = nt_seq
-                    row_dict["nt_length"] = nt_len
+                    row_dict = {
+                        "cluster_head": ch,
+                        "nt_sequence": nt_seq,
+                        "nt_length": nt_len,
+                    }
                 display_rows.append(row_dict)
 
             display_df = pd.DataFrame(display_rows)
@@ -2765,25 +2778,16 @@ def page_enrichment(conn: sqlite3.Connection):
                     return ["background-color: #fce8e8; color: #666666"] * len(row)
                 return [""] * len(row)
 
-            if show_aa:
-                n_sticky = display_df["sticky"].str.contains("YES", na=False).sum()
-                if n_sticky > 0:
-                    st.warning(f"⚠️ {n_sticky} sticky sequence(s) found — highlighted in red")
-                else:
-                    st.success("✅ No sticky sequences found in other runs")
-                st.dataframe(
-                    display_df.style.apply(highlight_sticky, axis=1),
-                    use_container_width=True
-                )
-            else:
-                n_sticky_nt = sum(1 for ch in [r["cluster_head"] for r in display_rows] if ch in sticky_cluster_heads)
-                if n_sticky_nt > 0:
-                    st.dataframe(
-                        display_df.style.apply(highlight_sticky_cm, axis=1),
-                        use_container_width=True
-                    )
-                else:
-                    st.dataframe(display_df, use_container_width=True)
+            def _highlight_sticky_seq(row):
+                ch = row.get("cluster_head", "")
+                if ch in sticky_cluster_heads:
+                    return ["background-color: #fce8e8; color: #666666"] * len(row)
+                return [""] * len(row)
+
+            st.dataframe(
+                display_df.style.apply(_highlight_sticky_seq, axis=1),
+                use_container_width=True
+            )
 
             # FASTA export uses whichever sequence is shown
             if show_aa and not aa_df.empty:
