@@ -37,7 +37,6 @@ from Bio.SeqRecord import SeqRecord
 import matplotlib.colors as mcolors
 from plotly.subplots import make_subplots
 
-
 # -----------------------------
 # Helpers (folders / names)
 # -----------------------------
@@ -1192,7 +1191,7 @@ def msa_to_colored_html(
 
     lines: list[str] = []
 
-    # Single-row mode (no wrapping; horizontal scroll) 
+    # Single-row mode (no wrapping; horizontal scroll)
     if block_size is None or int(block_size) <= 0:
         for sid, s in zip(ids, seqs):
             sid_pad = sid.ljust(name_w)
@@ -1529,6 +1528,25 @@ CREATE TABLE IF NOT EXISTS raw_sequences (
   PRIMARY KEY (run_id, target, barcode, aa_sequence)
 );
 
+-- Trimmed sticky sequence analysis results (separate from main sticky_sequences)
+CREATE TABLE IF NOT EXISTS sticky_sequences_trimmed (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id              TEXT NOT NULL,
+  target              TEXT NOT NULL,
+  cluster_head        TEXT NOT NULL,
+  aa_sequence         TEXT,
+  aa_length           INTEGER,
+  found_in_run_id     TEXT NOT NULL,
+  found_in_sample_id  TEXT,
+  found_in_target     TEXT NOT NULL,
+  found_in_barcode    TEXT NOT NULL,
+  read_count          INTEGER,
+  similarity          REAL,
+  trim_start          INTEGER,
+  flagged_at          TEXT,
+  UNIQUE(run_id, target, cluster_head, found_in_run_id, found_in_target, found_in_barcode, trim_start)
+);
+
 -- Confirmed sticky sequences across runs
 CREATE TABLE IF NOT EXISTS sticky_sequences (
   id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1554,9 +1572,10 @@ CREATE TABLE IF NOT EXISTS sticky_cache (
   run_id            TEXT,
   target            TEXT,
   similarity_thresh REAL,
+  trim_start        INTEGER DEFAULT 0,
   cached_at         TEXT,
   result_json       TEXT,
-  PRIMARY KEY (run_id, target, similarity_thresh)
+  PRIMARY KEY (run_id, target, similarity_thresh, trim_start)
 );
 
 -- Indexes for performance
@@ -1585,6 +1604,28 @@ def connect_db(db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA busy_timeout=10000;")
     conn.executescript(SCHEMA_SQL)
+
+    # Migration: fix sticky_cache primary key to include trim_start
+    try:
+        pk_info = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='sticky_cache'").fetchone()
+        if pk_info and "trim_start" not in pk_info[0].split("PRIMARY KEY")[1]:
+            conn.executescript("""
+                ALTER TABLE sticky_cache RENAME TO sticky_cache_old;
+                CREATE TABLE sticky_cache (
+                  run_id            TEXT,
+                  target            TEXT,
+                  similarity_thresh REAL,
+                  trim_start        INTEGER DEFAULT 0,
+                  cached_at         TEXT,
+                  result_json       TEXT,
+                  PRIMARY KEY (run_id, target, similarity_thresh, trim_start)
+                );
+                INSERT OR IGNORE INTO sticky_cache SELECT run_id, target, similarity_thresh, trim_start, cached_at, result_json FROM sticky_cache_old;
+                DROP TABLE sticky_cache_old;
+            """)
+    except Exception:
+        pass
+
     return conn
 
 
@@ -1596,7 +1637,7 @@ def sql_df(conn: sqlite3.Connection, sql: str, params=()) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# INGEST — whole run, one target at a time using Test12.py pipeline
+# INGEST — whole run, one target at a time
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _compute_target(args: dict) -> dict:
@@ -2065,16 +2106,13 @@ def find_sticky_sequences(
     target: str,
     cluster_heads: List[str],
     similarity_threshold: float = 1.0,
+    mismatch_mode: bool = False,
+    trim_start: int = 0,
 ) -> Dict[str, List[dict]]:
-    """
-    Check if cluster head sequences appear in raw_sequences from ANY other run.
-    Uses a single batched SQL query for exact match (default).
-    Returns {cluster_head: [{"run_id":..., "run_name":..., "target":..., "barcode":..., "read_count":...}]}
-    """
     if not cluster_heads:
         return {}
 
-    # Get AA sequences for all cluster heads in one query
+    # Get AA sequences for cluster heads
     placeholders = ",".join(["?"] * len(cluster_heads))
     seqs_df = sql_df(conn,
         f"SELECT cluster_head, aa_sequence FROM cluster_sequences "
@@ -2084,82 +2122,66 @@ def find_sticky_sequences(
     if seqs_df.empty:
         return {}
 
-    aa_to_cluster: Dict[str, str] = dict(zip(seqs_df["aa_sequence"], seqs_df["cluster_head"]))
-    all_seqs = [s for s in aa_to_cluster.keys() if s]
+    # Trim cluster head sequences
+    ch_to_trimmed = {}
+    for _, row in seqs_df.iterrows():
+        s = row["aa_sequence"]
+        if s and len(s) > trim_start:
+            ch_to_trimmed[row["cluster_head"]] = s[trim_start:]
+        elif s:
+            ch_to_trimmed[row["cluster_head"]] = s
 
-    if not all_seqs:
+    if not ch_to_trimmed:
+        return {}
+
+    # Get all other runs
+    other_runs = sql_df(conn, "SELECT run_id, sample_id FROM run WHERE run_id != ?", (run_id,))
+    if other_runs.empty:
         return {}
 
     results: Dict[str, List[dict]] = {}
 
-    if similarity_threshold >= 1.0:
-        # BATCHED exact match — single query for all sequences
-        seq_placeholders = ",".join(["?"] * len(all_seqs))
-        matches_df = sql_df(conn,
-            f"SELECT aa_sequence, run_id, target, barcode, read_count "
-            f"FROM raw_sequences "
-            f"WHERE aa_sequence IN ({seq_placeholders}) AND run_id != ?",
-            (*all_seqs, run_id))
+    # For each other run, fetch raw sequences and check for matches
+    for _, other_run in other_runs.iterrows():
+        other_run_id = other_run["run_id"]
+        other_run_name = other_run["sample_id"]
 
-        if not matches_df.empty:
-            # Fetch run names in one query
-            other_run_ids = matches_df["run_id"].unique().tolist()
-            run_id_placeholders = ",".join(["?"] * len(other_run_ids))
-            run_names_df = sql_df(conn,
-                f"SELECT run_id, sample_id FROM run WHERE run_id IN ({run_id_placeholders})",
-                tuple(other_run_ids))
-            run_names = dict(zip(run_names_df["run_id"], run_names_df["sample_id"])) if not run_names_df.empty else {}
+        raw = sql_df(conn,
+            "SELECT aa_sequence, target, barcode, read_count FROM raw_sequences WHERE run_id=?",
+            (other_run_id,))
 
-            for aa_seq, grp in matches_df.groupby("aa_sequence"):
-                ch = aa_to_cluster.get(aa_seq)
-                if not ch:
-                    continue
-                hit_list = []
-                for _, m in grp.iterrows():
-                    hit_list.append({
-                        "run_id": m["run_id"],
-                        "run_name": run_names.get(m["run_id"], m["run_id"][:8]),
-                        "target": m["target"],
-                        "barcode": m["barcode"],
-                        "read_count": int(m["read_count"]),
+        if raw.empty:
+            continue
+
+        # Trim raw sequences
+        raw["aa_trimmed"] = raw["aa_sequence"].apply(
+            lambda s: s[trim_start:] if s and len(s) > trim_start else s
+        )
+
+        # Build lookup: trimmed_seq -> list of (target, barcode, read_count)
+        trimmed_lookup = {}
+        for _, rrow in raw.iterrows():
+            t = rrow["aa_trimmed"]
+            if t:
+                if t not in trimmed_lookup:
+                    trimmed_lookup[t] = []
+                trimmed_lookup[t].append((rrow["target"], rrow["barcode"], int(rrow["read_count"])))
+
+        # Check each cluster head
+        for ch, trimmed_query in ch_to_trimmed.items():
+            if trimmed_query in trimmed_lookup:
+                for (other_target, other_barcode, other_read_count) in trimmed_lookup[trimmed_query]:
+                    if ch not in results:
+                        results[ch] = []
+                    results[ch].append({
+                        "run_id": other_run_id,
+                        "run_name": other_run_name,
+                        "target": other_target,
+                        "barcode": other_barcode,
+                        "read_count": other_read_count,
                     })
-                results[ch] = hit_list
-    else:
-        # Approximate match — per-sequence with length pre-filter
-        def seq_identity(a: str, b: str) -> float:
-            m = sum(ca == cb for ca, cb in zip(a, b))
-            return m / max(len(a), len(b))
-
-        # Fetch run names once
-        run_names_df = sql_df(conn, "SELECT run_id, sample_id FROM run WHERE run_id != ?", (run_id,))
-        run_names = dict(zip(run_names_df["run_id"], run_names_df["sample_id"])) if not run_names_df.empty else {}
-
-        for aa_seq, ch in aa_to_cluster.items():
-            min_len = int(len(aa_seq) * similarity_threshold)
-            max_len = int(len(aa_seq) / similarity_threshold) + 1
-            candidates = sql_df(conn,
-                "SELECT run_id, target, barcode, aa_sequence, read_count "
-                "FROM raw_sequences WHERE aa_length BETWEEN ? AND ? AND run_id != ?",
-                (min_len, max_len, run_id))
-            if candidates.empty:
-                continue
-            mask = candidates["aa_sequence"].apply(lambda s: seq_identity(aa_seq, s) >= similarity_threshold)
-            matches = candidates[mask]
-            if not matches.empty:
-                hit_list = []
-                for _, m in matches.iterrows():
-                    hit_list.append({
-                        "run_id": m["run_id"],
-                        "run_name": run_names.get(m["run_id"], m["run_id"][:8]),
-                        "target": m["target"],
-                        "barcode": m["barcode"],
-                        "read_count": int(m["read_count"]),
-                    })
-                results[ch] = hit_list
 
     return results
-
-
 
 
 def load_count_matrix(conn: sqlite3.Connection, run_id: str, target: str) -> pd.DataFrame:
@@ -2191,22 +2213,58 @@ def page_sticky(conn: sqlite3.Connection):
     st.header("Sticky Sequences")
     st.caption("Sequences flagged as appearing in raw translated reads of other runs. Populated as you browse the Enrichment page.")
 
-    total = conn.execute("SELECT COUNT(*) FROM sticky_sequences").fetchone()[0]
-    if total == 0:
-        st.info("No sticky sequences recorded yet. Browse targets on the Enrichment page to populate this database.")
-        return
+    def render_sticky_section(df_s, conn, title, download_filename):
+        """Render a sticky sequences section — identical format for both untrimmed and trimmed."""
+        st.subheader(title)
 
-    st.metric("Total sticky records", f"{total:,}")
+        if df_s.empty:
+            st.info("No sticky sequences found.")
+            return
 
-    # AA sequence search
+        # Add readable run names
+        run_name_map = {}
+        for rid in df_s["run_id"].unique():
+            r = conn.execute("SELECT sample_id FROM run WHERE run_id=?", (rid,)).fetchone()
+            run_name_map[rid] = r[0] if r else rid[:8]
+        found_name_map = {}
+        for rid in df_s["found_in_run_id"].unique():
+            r = conn.execute("SELECT sample_id FROM run WHERE run_id=?", (rid,)).fetchone()
+            found_name_map[rid] = r[0] if r else rid[:8]
+        df_s = df_s.copy()
+        df_s["run_name"] = df_s["run_id"].map(run_name_map)
+        df_s["found_in_run_name"] = df_s["found_in_run_id"].map(found_name_map)
+
+        c1, c2 = st.columns(2)
+        c1.metric("Total sticky records", f"{len(df_s):,}")
+        n_unique = df_s[["run_id","target","cluster_head"]].drop_duplicates().shape[0]
+        c2.metric("Unique sticky sequences", f"{n_unique:,}")
+
+        summary = (df_s.groupby(["run_name", "target", "cluster_head"])
+                   .agg(n_runs=("found_in_run_id", "nunique"),
+                        n_appearances=("found_in_run_id", "count"),
+                        aa_sequence=("aa_sequence", "first"),
+                        aa_length=("aa_length", "first"))
+                   .reset_index()
+                   .sort_values("n_runs", ascending=False))
+        st.write("Most frequent sticky sequences")
+        st.dataframe(summary, use_container_width=True)
+
+        display_cols = ["run_name", "target", "cluster_head", "aa_length",
+                        "found_in_run_name", "found_in_target", "found_in_barcode",
+                        "read_count", "similarity", "flagged_at"]
+        display_cols = [c for c in display_cols if c in df_s.columns]
+        st.write("Full sticky sequence records")
+        st.dataframe(df_s[display_cols], use_container_width=True)
+        st.download_button(f"Download CSV", df_s[display_cols].to_csv(index=False).encode(),
+                           download_filename, "text/csv", key=f"dl_{download_filename}")
+
+    # ── AA search
     st.subheader("Search for amino acid sequence")
     search_aa = st.text_input("Paste an amino acid sequence to check if it appears in sticky sequences",
                                placeholder="MAGPAGAA...", key="sticky_aa_search")
     if search_aa.strip():
         search_aa = search_aa.strip().upper()
-        match = sql_df(conn,
-            "SELECT * FROM sticky_sequences WHERE aa_sequence=?",
-            (search_aa,))
+        match = sql_df(conn, "SELECT * FROM sticky_sequences WHERE aa_sequence=?", (search_aa,))
         if match.empty:
             st.success("✅ This sequence does not appear in the sticky sequences database.")
         else:
@@ -2227,7 +2285,8 @@ def page_sticky(conn: sqlite3.Connection):
             st.dataframe(match[disp_cols], use_container_width=True)
 
     st.divider()
-    # Filters
+
+    # ── Filters (shared between untrimmed section)
     col1, col2 = st.columns(2)
     with col1:
         runs = sql_df(conn, "SELECT DISTINCT run_id FROM sticky_sequences")
@@ -2241,54 +2300,483 @@ def page_sticky(conn: sqlite3.Connection):
     with col2:
         sim_filter = st.slider("Min similarity threshold", 0.80, 1.0, 0.90, 0.01, format="%.2f")
 
-    # Query
+    # ── Untrimmed section
     if selected_run == "All":
-        df = sql_df(conn,
+        df_ut = sql_df(conn,
             "SELECT * FROM sticky_sequences WHERE similarity >= ? ORDER BY flagged_at DESC",
             (sim_filter,))
     else:
-        df = sql_df(conn,
+        df_ut = sql_df(conn,
             "SELECT * FROM sticky_sequences WHERE run_id=? AND similarity >= ? ORDER BY flagged_at DESC",
             (selected_run, sim_filter))
 
+    render_sticky_section(df_ut, conn, "Untrimmed sticky sequences", "sticky_untrimmed.csv")
+
+    # ── Trimmed section
+    st.divider()
+
+    trim_vals = sql_df(conn, "SELECT DISTINCT trim_start FROM sticky_sequences_trimmed ORDER BY trim_start")
+    if trim_vals.empty:
+        st.info("No trimmed sticky sequences found.")
+    else:
+        selected_trim = st.selectbox(
+            "Trimmed sticky sequences — select trim value",
+            trim_vals["trim_start"].tolist(),
+            format_func=lambda x: f"{x} AA trim",
+            key="sticky_trim_select"
+        )
+        df_tr = sql_df(conn,
+            "SELECT * FROM sticky_sequences_trimmed WHERE trim_start=? ORDER BY flagged_at DESC",
+            (selected_trim,))
+        render_sticky_section(df_tr, conn, f"Trimmed sticky sequences ({selected_trim} AA)", f"sticky_trimmed_{selected_trim}aa.csv")
+
+        # N-terminal prefix analysis
+        with st.expander("N-terminal prefix analysis", expanded=False):
+            prefix_len = st.selectbox(
+                "Show first N AAs",
+                options=trim_vals["trim_start"].tolist(),
+                index=0,
+                format_func=lambda x: f"{x} AAs",
+                key=f"prefix_len_{selected_trim}"
+            )
+            st.caption(f"Which first {prefix_len} AA prefix(es) unlock the most sticky matches when trimmed.")
+
+            if df_tr.empty:
+                st.info("No trimmed sticky sequences to analyze.")
+            else:
+                # Get run_id for each cluster head
+                ch_run_map = {}
+                for _, row in df_tr[["cluster_head","run_id"]].drop_duplicates().iterrows():
+                    ch_run_map[row["cluster_head"]] = row["run_id"]
+
+
+
+                # Fetch full AA sequences — search by cluster_head directly
+                ch_list_tr = list(ch_run_map.keys())
+                ph_tr = ",".join(["?"]*len(ch_list_tr))
+                seq_results = conn.execute(
+                    f"SELECT cluster_head, aa_sequence FROM cluster_sequences WHERE cluster_head IN ({ph_tr})",
+                    ch_list_tr
+                ).fetchall()
+                seq_map = {r[0]: r[1] for r in seq_results}
+
+                prefix_rows = []
+                for ch in ch_list_tr:
+                    aa_seq = seq_map.get(ch)
+                    if aa_seq and len(aa_seq) >= prefix_len:
+                        prefix = aa_seq[:prefix_len]
+                        n_sticky = len(df_tr[df_tr["cluster_head"] == ch])
+                        prefix_rows.append({
+                            "cluster_head": ch,
+                            "prefix": prefix,
+                            "n_sticky_matches": n_sticky,
+                        })
+
+                if not prefix_rows:
+                    st.info("Could not retrieve sequence data for prefix analysis.")
+
+                if prefix_rows:
+                    prefix_df = pd.DataFrame(prefix_rows)
+                    prefix_summary = (prefix_df.groupby("prefix")
+                        .agg(
+                            n_sequences=("cluster_head", "nunique"),
+                            total_sticky_matches=("n_sticky_matches", "sum")
+                        )
+                        .reset_index()
+                        .sort_values("total_sticky_matches", ascending=False)
+                        .rename(columns={"prefix": f"First {prefix_len} AA{'s' if prefix_len > 1 else ''}",
+                                         "n_sequences": "Unique sequences",
+                                         "total_sticky_matches": "Total sticky matches"}))
+                    st.dataframe(prefix_summary, use_container_width=True)
+                else:
+                    st.info("Could not retrieve prefix data.")
+
+    # ── Global trimmed analysis at the bottom
+def page_visualization(conn: sqlite3.Connection):
+    st.header("Data Visualization")
+    st.caption("Absolute and normalized counts across all runs and targets.")
+
+    # Load all target_run data
+    df = sql_df(conn, """
+        SELECT tr.run_id, r.sample_id, tr.target,
+               tr.total_reads_control, tr.total_reads_1xpanned, tr.total_reads_2xpanned,
+               tr.kept_filtered, tr.n_clusters
+        FROM target_run tr
+        JOIN run r ON tr.run_id = r.run_id
+        ORDER BY r.sample_id, tr.target
+    """)
+
     if df.empty:
-        st.info("No sticky sequences match the current filters.")
+        st.info("No data found. Ingest some runs first.")
         return
 
-    # Add sample_id for readability
-    run_name_map = {}
-    for rid in df["run_id"].unique():
-        r = conn.execute("SELECT sample_id FROM run WHERE run_id=?", (rid,)).fetchone()
-        run_name_map[rid] = r[0] if r else rid[:8]
-    found_name_map = {}
-    for rid in df["found_in_run_id"].unique():
-        r = conn.execute("SELECT sample_id FROM run WHERE run_id=?", (rid,)).fetchone()
-        found_name_map[rid] = r[0] if r else rid[:8]
+    # Run and target filters
+    all_runs = sorted(df["sample_id"].unique().tolist())
+    saved_viz_runs = st.session_state.get("viz_runs_saved", [])
+    selected_runs = st.multiselect("1. Select run(s)", all_runs,
+        default=[r for r in saved_viz_runs if r in all_runs],
+        key="viz_runs", placeholder="Choose one or more runs...")
+    st.session_state["viz_runs_saved"] = selected_runs
+    if not selected_runs:
+        st.info("Select at least one run to continue.")
+        show_charts = False
+        selected_targets = []
+    else:
+        available_targets = sorted(df[df["sample_id"].isin(selected_runs)]["target"].unique().tolist())
+        saved_viz_targets = st.session_state.get("viz_targets_saved", [])
+        selected_targets = st.multiselect("2. Select target(s)", available_targets,
+            default=[t for t in saved_viz_targets if t in available_targets],
+            key="viz_targets", placeholder="Choose one or more targets...")
+        st.session_state["viz_targets_saved"] = selected_targets
+        if not selected_targets:
+            st.info("Select at least one target to view charts.")
+            show_charts = False
+        else:
+            df = df[df["sample_id"].isin(selected_runs) & df["target"].isin(selected_targets)].copy()
+            show_charts = True
 
-    df["run_name"] = df["run_id"].map(run_name_map)
-    df["found_in_run_name"] = df["found_in_run_id"].map(found_name_map)
+    df = df[df["sample_id"].isin(selected_runs) & df["target"].isin(selected_targets)].copy()
+    normalize = False
+    if show_charts:
+        df["label"] = df["sample_id"] + " / " + df["target"]
 
-    # Summary: which sequences appear in the most runs
-    st.subheader("Most frequent sticky sequences")
-    summary = (df.groupby(["run_name", "target", "cluster_head"])
-               .agg(n_runs=("found_in_run_id", "nunique"),
-                    n_appearances=("found_in_run_id", "count"),
-                    aa_sequence=("aa_sequence", "first"),
-                    aa_length=("aa_length", "first"))
-               .reset_index()
-               .sort_values("n_runs", ascending=False))
-    st.dataframe(summary, use_container_width=True)
+        norm_mode = st.radio("View", ["Non-normalized (absolute)", "Normalized (% of total reads in run)"],
+                              horizontal=True)
+        normalize = norm_mode.startswith("Normalized")
 
-    st.subheader("Full sticky sequence records")
-    display_cols = ["run_name", "target", "cluster_head", "aa_length",
-                    "found_in_run_name", "found_in_target", "found_in_barcode",
-                    "read_count", "similarity", "flagged_at"]
-    display_cols = [c for c in display_cols if c in df.columns]
-    st.dataframe(df[display_cols], use_container_width=True)
+    # ── Total reads per barcode
+    st.subheader("Total reads per barcode")
+    if normalize:
+        # Show each barcode as % of total reads in that run
+        df["total_reads_run"] = df["total_reads_control"] + df["total_reads_1xpanned"] + df["total_reads_2xpanned"]
+        df["pct_control"] = df.apply(lambda r: 100 * r["total_reads_control"] / r["total_reads_run"] if r["total_reads_run"] > 0 else 0, axis=1)
+        df["pct_r1"]      = df.apply(lambda r: 100 * r["total_reads_1xpanned"] / r["total_reads_run"] if r["total_reads_run"] > 0 else 0, axis=1)
+        df["pct_r2"]      = df.apply(lambda r: 100 * r["total_reads_2xpanned"] / r["total_reads_run"] if r["total_reads_run"] > 0 else 0, axis=1)
+        y_control = df["pct_control"]
+        y_r1      = df["pct_r1"]
+        y_r2      = df["pct_r2"]
+        y_label   = "% of total reads in run"
+    else:
+        y_control = df["total_reads_control"]
+        y_r1 = df["total_reads_1xpanned"]
+        y_r2 = df["total_reads_2xpanned"]
+        y_label = "Read count"
 
-    st.download_button("Download sticky sequences CSV",
-                       df[display_cols].to_csv(index=False).encode(),
-                       "sticky_sequences.csv", "text/csv")
+    if show_charts:
+            fig_reads = go.Figure()
+            fig_reads.add_trace(go.Bar(name="Control (TG1)", x=df["label"], y=y_control, marker_color="#4C78A8"))
+            fig_reads.add_trace(go.Bar(name="1x panned (R1)", x=df["label"], y=y_r1, marker_color="#F58518"))
+            fig_reads.add_trace(go.Bar(name="2x panned (R2)", x=df["label"], y=y_r2, marker_color="#54A24B"))
+            fig_reads.update_layout(
+                barmode="group",
+                xaxis_tickangle=-45,
+                yaxis_title=y_label,
+                height=500,
+                margin=dict(b=200),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02)
+            )
+            st.plotly_chart(fig_reads, use_container_width=True)
+
+            # ── Sequences passing filter
+            st.subheader("Sequences passing filter")
+            if normalize:
+                total = df["total_reads_control"] + df["total_reads_1xpanned"] + df["total_reads_2xpanned"]
+                y_filtered = df.apply(
+                    lambda r: 100 * r["kept_filtered"] / (r["total_reads_control"] + r["total_reads_1xpanned"] + r["total_reads_2xpanned"])
+                    if (r["total_reads_control"] + r["total_reads_1xpanned"] + r["total_reads_2xpanned"]) > 0 else 0, axis=1)
+                y_filt_label = "Filtered sequences as % of total reads"
+            else:
+                y_filtered = df["kept_filtered"]
+                y_filt_label = "Filtered sequences"
+
+            fig_filtered = go.Figure(go.Bar(
+                x=df["label"], y=y_filtered,
+                marker_color="#B279A2"
+            ))
+            fig_filtered.update_layout(
+                xaxis_tickangle=-45,
+                yaxis_title=y_filt_label,
+                height=450,
+                margin=dict(b=200)
+            )
+            st.plotly_chart(fig_filtered, use_container_width=True)
+
+            # ── Number of clusters
+            st.subheader("Number of clusters")
+            fig_clusters = go.Figure(go.Bar(
+                x=df["label"], y=df["n_clusters"],
+                marker_color="#E45756"
+            ))
+            fig_clusters.update_layout(
+                xaxis_tickangle=-45,
+                yaxis_title="Number of clusters",
+                height=450,
+                margin=dict(b=200)
+            )
+            st.plotly_chart(fig_clusters, use_container_width=True)
+
+            # ── Summary table (inside show_charts)
+            with st.expander("Raw data table"):
+                st.dataframe(df[["sample_id", "target", "total_reads_control",
+                                  "total_reads_1xpanned", "total_reads_2xpanned",
+                                  "kept_filtered", "n_clusters"]].rename(columns={
+                    "sample_id": "Run",
+                    "total_reads_control": "Control reads",
+                    "total_reads_1xpanned": "R1 reads",
+                    "total_reads_2xpanned": "R2 reads",
+                    "kept_filtered": "Filtered sequences",
+                    "n_clusters": "Clusters"
+                }), use_container_width=True)
+                st.download_button("Download CSV",
+                    df[["sample_id","target","total_reads_control","total_reads_1xpanned",
+                        "total_reads_2xpanned","kept_filtered","n_clusters"]].to_csv(index=False).encode(),
+                    "visualization_data.csv", "text/csv")
+
+    # ── PCA Analysis (Matthias approach: AA composition per sequence)
+    st.subheader("PCA — top 100 enriched sequences per target")
+    st.caption("Each point is one nanobody sequence. Features are amino acid composition (or dipeptide k-mers). Colored by target, run, sticky flag, or fold enrichment.")
+
+    try:
+        from sklearn.decomposition import PCA
+        from sklearn.preprocessing import StandardScaler
+    except ImportError:
+        st.warning("scikit-learn is required for PCA. Install with: `pip install scikit-learn`")
+        return
+
+    AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
+
+    def aa_composition(seq):
+        l = max(len(seq), 1)
+        return [seq.count(aa) / l for aa in AMINO_ACIDS]
+
+    # Step 1: select runs and targets before running PCA
+    all_runs = sql_df(conn, "SELECT run_id, sample_id FROM run ORDER BY sample_id")
+    run_options = dict(zip(all_runs["sample_id"], all_runs["run_id"]))
+
+    selected_run_names = st.multiselect(
+        "1. Select run(s)",
+        options=list(run_options.keys()),
+        default=[],
+        key="pca_runs",
+        placeholder="Choose one or more runs..."
+    )
+    if not selected_run_names:
+        st.info("Select at least one run to continue.")
+        return
+    selected_run_ids = [run_options[r] for r in selected_run_names]
+
+    # Step 2: select targets within those runs
+    placeholders_runs_pre = ",".join(["?"]*len(selected_run_ids))
+    available_targets = sql_df(conn,
+        f"SELECT DISTINCT target FROM target_run WHERE run_id IN ({placeholders_runs_pre}) ORDER BY target",
+        tuple(selected_run_ids))["target"].tolist()
+
+    selected_targets = st.multiselect(
+        "2. Select target(s)",
+        options=available_targets,
+        default=[],
+        key="pca_targets",
+        placeholder="Choose one or more targets..."
+    )
+    if not selected_targets:
+        st.info("Select at least one target to continue.")
+        return
+
+    color_by = "target"
+    top_n_pca = st.slider("3. Top N sequences per target", 10, 200, 100, 10, key="pca_top_n")
+
+    if not st.button("Run PCA", type="primary", key="run_pca_btn"):
+        return
+
+    # Fetch run/target combinations for selected filters
+    placeholders_runs = ",".join(["?"]*len(selected_run_ids))
+    placeholders_targets = ",".join(["?"]*len(selected_targets))
+    all_targets = sql_df(conn, f"""
+        SELECT DISTINCT tr.run_id, r.sample_id, tr.target
+        FROM target_run tr JOIN run r ON tr.run_id = r.run_id
+        WHERE tr.run_id IN ({placeholders_runs})
+        AND tr.target IN ({placeholders_targets})
+    """, (*selected_run_ids, *selected_targets))
+
+    if all_targets.empty:
+        st.info("No data available for selected runs and targets.")
+        return
+
+    seq_records = []
+    for _, trow in all_targets.iterrows():
+        # Get top N enriched cluster heads
+        top = sql_df(conn, """
+            SELECT cc.cluster_head,
+                   MAX(CASE WHEN cc.library_id='2xpanned' THEN cc.norm_count ELSE 0 END) as r2_norm,
+                   MAX(CASE WHEN cc.library_id='control' THEN cc.norm_count ELSE 0 END) as ctrl_norm
+            FROM cluster_counts cc
+            WHERE cc.run_id=? AND cc.target=?
+            GROUP BY cc.cluster_head
+        """, (trow["run_id"], trow["target"]))
+        if top.empty:
+            continue
+        top["fold_enrichment"] = top.apply(
+            lambda r: round(r["r2_norm"] / r["ctrl_norm"], 2) if r["ctrl_norm"] > 0 else None, axis=1)
+        top = top.sort_values(["fold_enrichment", "r2_norm"], ascending=[False, False], na_position="last").head(top_n_pca)
+
+        # Get AA sequences
+        ch_list = top["cluster_head"].tolist()
+        placeholders = ",".join(["?"]*len(ch_list))
+        seqs = sql_df(conn,
+            f"SELECT cluster_head, aa_sequence FROM cluster_sequences WHERE run_id=? AND target=? AND cluster_head IN ({placeholders})",
+            (trow["run_id"], trow["target"], *ch_list))
+        if seqs.empty:
+            continue
+
+        fold_map = dict(zip(top["cluster_head"], top["fold_enrichment"]))
+
+        # Get sticky cluster heads
+        sticky_df = sql_df(conn,
+            f"SELECT DISTINCT cluster_head FROM sticky_sequences WHERE run_id=? AND target=? AND cluster_head IN ({placeholders})",
+            (trow["run_id"], trow["target"], *ch_list))
+        sticky_set = set(sticky_df["cluster_head"].tolist()) if not sticky_df.empty else set()
+
+        for _, srow in seqs.iterrows():
+            if not srow["aa_sequence"]:
+                continue
+            seq_records.append({
+                "cluster_head": srow["cluster_head"],
+                "aa_sequence": srow["aa_sequence"],
+                "target": trow["target"],
+                "run": trow["sample_id"],
+                "fold_enrichment": fold_map.get(srow["cluster_head"], 0),
+                "sticky": "⚠️ Sticky" if srow["cluster_head"] in sticky_set else "Not sticky",
+            })
+
+    if len(seq_records) < 3:
+        st.info("Not enough sequences for PCA. Need at least 3.")
+        return
+
+    seq_df_pca = pd.DataFrame(seq_records)
+    st.caption(f"{len(seq_df_pca):,} sequences from {seq_df_pca['target'].nunique()} target(s) across {seq_df_pca['run'].nunique()} run(s)")
+
+    # Compute features
+    with st.spinner("Computing sequence features..."):
+        X = np.array([aa_composition(s) for s in seq_df_pca["aa_sequence"]])
+
+        X_scaled = StandardScaler().fit_transform(X)
+        n_components = min(10, X_scaled.shape[0], X_scaled.shape[1])
+        pca = PCA(n_components=n_components)
+        coords = pca.fit_transform(X_scaled)
+        var_explained = pca.explained_variance_ratio_ * 100
+
+    # Enforce consistent sign convention across platforms
+    # Make the component with largest absolute value positive
+    for i in range(coords.shape[1]):
+        if coords[np.argmax(np.abs(coords[:, i])), i] < 0:
+            coords[:, i] *= -1
+
+    seq_df_pca["PC1"] = coords[:, 0]
+    seq_df_pca["PC2"] = coords[:, 1]
+
+    # Plot — distinct colors, larger dots, confidence ellipses, clipped axes
+    # Distinct colorblind-friendly palette
+    PALETTE = [
+        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+        "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+        "#aec7e8", "#ffbb78", "#98df8a", "#ff9896", "#c5b0d5",
+        "#c49c94", "#f7b6d2", "#dbdb8d", "#9edae5", "#393b79",
+    ]
+
+    # Clip axes to 99th percentile to avoid outliers squishing the main cluster
+    p1_lo, p1_hi = np.percentile(seq_df_pca["PC1"], [0.5, 99.5])
+    p2_lo, p2_hi = np.percentile(seq_df_pca["PC2"], [0.5, 99.5])
+    pad1 = (p1_hi - p1_lo) * 0.1
+    pad2 = (p2_hi - p2_lo) * 0.1
+
+    fig_pca = go.Figure()
+    groups = sorted(seq_df_pca["target"].unique())
+
+    for i, group in enumerate(groups):
+        color = PALETTE[i % len(PALETTE)]
+        sub = seq_df_pca[seq_df_pca["target"] == group].copy()
+
+        # Confidence ellipse — computed only on inlier points (within 2.5 SD of mean)
+        if len(sub) >= 5:
+            pc1_g = sub["PC1"].values
+            pc2_g = sub["PC2"].values
+            # Filter to inliers (remove extreme outliers before computing ellipse)
+            m1, s1 = pc1_g.mean(), pc1_g.std()
+            m2, s2 = pc2_g.mean(), pc2_g.std()
+            inlier_mask = (np.abs(pc1_g - m1) < 2.5 * s1) & (np.abs(pc2_g - m2) < 2.5 * s2)
+            pc1_in = pc1_g[inlier_mask]
+            pc2_in = pc2_g[inlier_mask]
+            if len(pc1_in) >= 5:
+                cov = np.cov(pc1_in, pc2_in)
+                mean_x, mean_y = pc1_in.mean(), pc2_in.mean()
+                vals, vecs = np.linalg.eigh(cov)
+                vals = np.maximum(vals, 0)
+                order = vals.argsort()[::-1]
+                vals, vecs = vals[order], vecs[:, order]
+                scale = np.sqrt(5.991)  # 95% confidence
+                theta = np.linspace(0, 2 * np.pi, 200)
+                ellipse_x = scale * np.sqrt(vals[0]) * np.cos(theta)
+                ellipse_y = scale * np.sqrt(vals[1]) * np.sin(theta)
+                rot = np.column_stack([ellipse_x, ellipse_y]) @ vecs.T
+                ex = rot[:, 0] + mean_x
+                ey = rot[:, 1] + mean_y
+                fig_pca.add_trace(go.Scatter(
+                    x=ex, y=ey,
+                    mode="lines",
+                    line=dict(color=color, width=1.5, dash="dot"),
+                    showlegend=False,
+                    hoverinfo="skip",
+                    name=f"{group}_ellipse",
+                ))
+
+        # Scatter points
+        fig_pca.add_trace(go.Scatter(
+            x=sub["PC1"], y=sub["PC2"],
+            mode="markers",
+            marker=dict(size=8, color=color, opacity=0.75,
+                        line=dict(width=0.5, color="white")),
+            name=group,
+            text=sub.apply(lambda r: f"<b>{r['target']}</b><br>Run: {r['run']}<br>Fold: {r['fold_enrichment']:.1f}x", axis=1),
+            hovertemplate="%{text}<extra></extra>",
+        ))
+
+    fig_pca.update_layout(
+        xaxis=dict(
+            title=dict(text=f"PC1 ({var_explained[0]:.1f}% variance explained)", font=dict(color="#000000")),
+            tickfont=dict(color="#000000"),
+            showgrid=True, gridcolor="#eeeeee", zeroline=True, zerolinecolor="#cccccc",
+            autorange=True,
+        ),
+        yaxis=dict(
+            title=dict(text=f"PC2 ({var_explained[1]:.1f}% variance explained)", font=dict(color="#000000")),
+            tickfont=dict(color="#000000"),
+            showgrid=True, gridcolor="#eeeeee", zeroline=True, zerolinecolor="#cccccc",
+            autorange=True,
+        ),
+        height=650,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        legend=dict(
+            title=dict(text="Target", font=dict(color="#000000", size=13)),
+            orientation="v",
+            bgcolor="rgba(255,255,255,0.95)",
+            bordercolor="#cccccc",
+            borderwidth=1,
+            font=dict(color="#000000", size=12),
+        ),
+        title=dict(
+            text=f"Nanobody Sequence Space — Top {top_n_pca} Enriched per Target",
+            font=dict(size=16, color="#000000"),
+            x=0.5, xanchor="center",
+        ),
+        font=dict(size=13, color="#000000"),
+        margin=dict(l=60, r=20, t=60, b=60),
+    )
+    st.plotly_chart(fig_pca, use_container_width=True)
+    st.caption("Each dot is one nanobody sequence. Dashed ellipses show the 95% confidence region for each target. Sequences closer together have more similar amino acid compositions.")
+
+
+
 
 
 def page_overview(conn: sqlite3.Connection):
@@ -2625,59 +3113,99 @@ def page_enrichment(conn: sqlite3.Connection):
         cm_display = cm_display.sort_values("fold_enrichment", ascending=False, na_position="last")
 
     # Compute sticky sequences early so we can highlight both tables
-    sticky_threshold = st.slider(
-        "Sticky sequence similarity threshold",
-        min_value=0.80, max_value=1.0, value=1.0, step=0.01,
-        format="%.2f",
-        help="1.0 = exact match only. Lower values catch near-identical sequences across runs.",
-        key=f"sticky_thresh_{run_id}_{target}"
-    )
+    sticky_mode = "percent"
 
     top_ids = cm_display["cluster_head"].astype(str).head(top_n).tolist()
     other_runs = sql_df(conn, "SELECT run_id FROM run WHERE run_id != ?", (run_id,))
-    if not other_runs.empty:
-        sticky_cache_key = f"sticky_{run_id}_{target}_{sticky_threshold}"
-        cached = conn.execute(
-            "SELECT result_json FROM sticky_cache WHERE run_id=? AND target=? AND similarity_thresh=?",
-            (run_id, target, float(sticky_threshold))
-        ).fetchone()
-        if cached:
-            import json as _json
-            sticky_map = _json.loads(cached[0])
-        else:
-            with st.spinner("Checking for sticky sequences across other runs..."):
-                sticky_map = find_sticky_sequences(
+
+    import json as _json
+
+    # Sticky detection controls
+    col_s1, col_s2, col_s3 = st.columns([2, 2, 1])
+    with col_s1:
+        sticky_threshold = st.slider(
+            "Sticky similarity threshold",
+            min_value=0.80, max_value=1.0,
+            value=st.session_state.get("sticky_thresh_global", 1.0),
+            step=0.01, format="%.2f",
+            key="sticky_thresh_global"
+        )
+    with col_s2:
+        trim_options = ["None (untrimmed only)", "1 AA", "2 AA", "3 AA", "4 AA", "5 AA"]
+        trim_choice = st.selectbox(
+            "Also run trimmed analysis",
+            trim_options,
+            index=st.session_state.get("sticky_trim_choice_idx", 0),
+            key="sticky_trim_choice"
+        )
+        sticky_trim_start = 0 if trim_choice == "None (untrimmed only)" else int(trim_choice.split()[0])
+        st.session_state["sticky_trim_choice_idx"] = trim_options.index(trim_choice)
+    with col_s3:
+        st.write("")
+        st.write("")
+        run_sticky_btn = st.button("Run sticky detection", type="primary", key=f"run_sticky_{run_id}_{target}")
+
+    def run_sticky_detection(trim=0):
+        """Run sticky detection for given trim value, return sticky_map."""
+
+        def build_smap_from_rows(existing):
+            """Build sticky_map dict from existing DB rows."""
+            smap = {}
+            run_name_map = {}
+            for _, erow in existing.iterrows():
+                ch = erow["cluster_head"]
+                rid = erow["found_in_run_id"]
+                if rid not in run_name_map:
+                    r = conn.execute("SELECT sample_id FROM run WHERE run_id=?", (rid,)).fetchone()
+                    run_name_map[rid] = r[0] if r else rid[:8]
+                if ch not in smap:
+                    smap[ch] = []
+                smap[ch].append({
+                    "run_id": rid,
+                    "run_name": run_name_map[rid],
+                    "target": erow["found_in_target"],
+                    "barcode": erow["found_in_barcode"],
+                    "read_count": int(erow["read_count"]),
+                })
+            return smap
+
+        if trim == 0:
+            # Always read directly from sticky_sequences — no cache needed
+            existing = sql_df(conn,
+                "SELECT cluster_head, found_in_run_id, found_in_target, found_in_barcode, read_count FROM sticky_sequences WHERE run_id=? AND target=?",
+                (run_id, target))
+            if not existing.empty:
+                return build_smap_from_rows(existing)
+            # Not in table yet — compute and store
+            with st.spinner("Checking for sticky sequences..."):
+                smap = find_sticky_sequences(
                     conn, run_id, target, top_ids,
-                    similarity_threshold=float(sticky_threshold)
+                    similarity_threshold=float(sticky_threshold),
+                    trim_start=0
                 )
-            import json as _json
             now = datetime.utcnow().isoformat()
             with conn:
+                # Always write to cache so we know detection was run (even if empty)
                 conn.execute(
                     """INSERT OR REPLACE INTO sticky_cache
-                       (run_id, target, similarity_thresh, cached_at, result_json)
-                       VALUES (?,?,?,?,?)""",
-                    (run_id, target, float(sticky_threshold), now, _json.dumps(sticky_map))
+                       (run_id, target, similarity_thresh, trim_start, cached_at, result_json)
+                       VALUES (?,?,?,?,?,?)""",
+                    (run_id, target, float(sticky_threshold), 0, now, _json.dumps(smap))
                 )
-                # Persist to sticky_sequences table
-                if sticky_map:
-                    ch_list = list(sticky_map.keys())
+                if smap:
+                    ch_list = list(smap.keys())
                     ph = ",".join(["?"]*len(ch_list))
                     seq_rows_db = conn.execute(
                         f"SELECT cluster_head, aa_sequence, aa_length FROM cluster_sequences WHERE run_id=? AND target=? AND cluster_head IN ({ph})",
                         (run_id, target, *ch_list)
                     ).fetchall()
                     seq_lookup = {r[0]: (r[1], r[2]) for r in seq_rows_db}
-                    sticky_rows = []
-                    for ch, hits in sticky_map.items():
-                        aa_seq, aa_len = seq_lookup.get(ch, (None, None))
-                        for h in hits:
-                            sticky_rows.append((
-                                run_id, target, ch, aa_seq, aa_len,
-                                h["run_id"], h.get("run_name"), h["target"],
-                                h["barcode"], h["read_count"],
-                                float(sticky_threshold), now
-                            ))
+                    sticky_rows = [(
+                        run_id, target, ch, seq_lookup.get(ch, (None, None))[0],
+                        seq_lookup.get(ch, (None, None))[1],
+                        h["run_id"], h.get("run_name"), h["target"],
+                        h["barcode"], h["read_count"], float(sticky_threshold), now
+                    ) for ch, hits in smap.items() for h in hits]
                     conn.executemany(
                         """INSERT OR IGNORE INTO sticky_sequences
                            (run_id, target, cluster_head, aa_sequence, aa_length,
@@ -2686,27 +3214,164 @@ def page_enrichment(conn: sqlite3.Connection):
                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                         sticky_rows
                     )
+            return smap
+
+        else:
+            # Trim > 0: read from sticky_sequences_trimmed, fall back to cache, then recompute
+            existing = sql_df(conn,
+                "SELECT cluster_head, found_in_run_id, found_in_target, found_in_barcode, read_count FROM sticky_sequences_trimmed WHERE run_id=? AND target=? AND trim_start=?",
+                (run_id, target, trim))
+            if not existing.empty:
+                return build_smap_from_rows(existing)
+
+            # Check cache
+            cached = conn.execute(
+                "SELECT result_json FROM sticky_cache WHERE run_id=? AND target=? AND similarity_thresh=? AND trim_start=?",
+                (run_id, target, float(sticky_threshold), trim)
+            ).fetchone()
+            if cached:
+                return _json.loads(cached[0])
+
+            # Recompute
+            with st.spinner(f"Checking for sticky sequences (trim={trim})..."):
+                smap = find_sticky_sequences(
+                    conn, run_id, target, top_ids,
+                    similarity_threshold=float(sticky_threshold),
+                    trim_start=trim
+                )
+            now = datetime.utcnow().isoformat()
+            # Use fresh connection to guarantee write
+            _db_path = conn.execute("PRAGMA database_list").fetchone()[2]
+            _write_conn = sqlite3.connect(_db_path, timeout=30, check_same_thread=False)
+            try:
+                _write_conn.execute(
+                    """INSERT OR REPLACE INTO sticky_cache
+                       (run_id, target, similarity_thresh, trim_start, cached_at, result_json)
+                       VALUES (?,?,?,?,?,?)""",
+                    (run_id, target, float(sticky_threshold), trim, now, _json.dumps(smap))
+                )
+                if smap:
+                    ch_list = list(smap.keys())
+                    ph = ",".join(["?"]*len(ch_list))
+                    seq_rows_db = conn.execute(
+                        f"SELECT cluster_head, aa_sequence, aa_length FROM cluster_sequences WHERE run_id=? AND target=? AND cluster_head IN ({ph})",
+                        (run_id, target, *ch_list)
+                    ).fetchall()
+                    seq_lookup = {r[0]: (r[1], r[2]) for r in seq_rows_db}
+                    sticky_rows = [(
+                        run_id, target, ch, seq_lookup.get(ch, (None, None))[0],
+                        seq_lookup.get(ch, (None, None))[1],
+                        h["run_id"], h.get("run_name"), h["target"],
+                        h["barcode"], h["read_count"], float(sticky_threshold), now
+                    ) for ch, hits in smap.items() for h in hits]
+                    _write_conn.executemany(
+                        """INSERT OR IGNORE INTO sticky_sequences_trimmed
+                           (run_id, target, cluster_head, aa_sequence, aa_length,
+                            found_in_run_id, found_in_sample_id, found_in_target,
+                            found_in_barcode, read_count, similarity, flagged_at, trim_start)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        [r + (trim,) for r in sticky_rows]
+                    )
+                _write_conn.commit()
+            finally:
+                _write_conn.close()
+            return smap
+
+    if not other_runs.empty:
+        if run_sticky_btn:
+            sticky_map = run_sticky_detection(trim=0)
+            if sticky_trim_start > 0:
+                trimmed_sticky_map = run_sticky_detection(trim=sticky_trim_start)
+            else:
+                trimmed_sticky_map = {}
+        else:
+            # Load existing results from DB without computing
+            sticky_map = run_sticky_detection(trim=0) if False else {}
+            trimmed_sticky_map = {}
+            # Read from persistent tables directly
+            existing_ut = sql_df(conn,
+                "SELECT cluster_head, found_in_run_id, found_in_target, found_in_barcode, read_count FROM sticky_sequences WHERE run_id=? AND target=?",
+                (run_id, target))
+            if not existing_ut.empty:
+                run_name_map_ut = {}
+                for _, erow in existing_ut.iterrows():
+                    ch = erow["cluster_head"]
+                    rid = erow["found_in_run_id"]
+                    if rid not in run_name_map_ut:
+                        r = conn.execute("SELECT sample_id FROM run WHERE run_id=?", (rid,)).fetchone()
+                        run_name_map_ut[rid] = r[0] if r else rid[:8]
+                    if ch not in sticky_map:
+                        sticky_map[ch] = []
+                    sticky_map[ch].append({
+                        "run_id": rid,
+                        "run_name": run_name_map_ut[rid],
+                        "target": erow["found_in_target"],
+                        "barcode": erow["found_in_barcode"],
+                        "read_count": int(erow["read_count"]),
+                    })
+            if sticky_trim_start > 0:
+                existing_tr = sql_df(conn,
+                    "SELECT cluster_head, found_in_run_id, found_in_target, found_in_barcode, read_count FROM sticky_sequences_trimmed WHERE run_id=? AND target=? AND trim_start=?",
+                    (run_id, target, sticky_trim_start))
+                if not existing_tr.empty:
+                    run_name_map_tr = {}
+                    for _, erow in existing_tr.iterrows():
+                        ch = erow["cluster_head"]
+                        rid = erow["found_in_run_id"]
+                        if rid not in run_name_map_tr:
+                            r = conn.execute("SELECT sample_id FROM run WHERE run_id=?", (rid,)).fetchone()
+                            run_name_map_tr[rid] = r[0] if r else rid[:8]
+                        if ch not in trimmed_sticky_map:
+                            trimmed_sticky_map[ch] = []
+                        trimmed_sticky_map[ch].append({
+                            "run_id": rid,
+                            "run_name": run_name_map_tr[rid],
+                            "target": erow["found_in_target"],
+                            "barcode": erow["found_in_barcode"],
+                            "read_count": int(erow["read_count"]),
+                        })
     else:
         sticky_map = {}
+        trimmed_sticky_map = {}
 
     # Sticky cluster heads set
     sticky_cluster_heads = set(sticky_map.keys())
+    trimmed_sticky_heads = set(trimmed_sticky_map.keys())
 
     def highlight_sticky_cm(row):
         if row.get("cluster_head") in sticky_cluster_heads:
             return ["background-color: #fce8e8; color: #666666"] * len(row)
         return [""] * len(row)
 
+    preferred = ["cluster_head","control_norm","1xpanned_norm","2xpanned_norm","fold_enrichment"]
+    display_cols = [c for c in preferred if c in cm_display.columns]
+    cm_show = cm_display[display_cols].head(top_n).copy()
+    for _col in ["control_norm", "1xpanned_norm", "2xpanned_norm", "fold_enrichment"]:
+        if _col in cm_show.columns:
+            cm_show[_col] = pd.to_numeric(cm_show[_col], errors="coerce").round(2 if _col == "fold_enrichment" else 0)
+            if _col != "fold_enrichment":
+                cm_show[_col] = cm_show[_col].astype("Int64")
+
+    # Check if sticky detection has been run for this target
+    sticky_run = conn.execute(
+        "SELECT COUNT(*) FROM sticky_sequences WHERE run_id=? AND target=?",
+        (run_id, target)
+    ).fetchone()[0]
+    # Also check cache to see if it was run and found nothing
+    # Check sticky_cache to see if detection was run (even if result was empty)
+    sticky_cached = conn.execute(
+        "SELECT COUNT(*) FROM sticky_cache WHERE run_id=? AND target=? AND trim_start=0",
+        (run_id, target)
+    ).fetchone()[0]
+    sticky_ever_run = sticky_run > 0 or sticky_cached > 0 or run_sticky_btn
+
     st.subheader(f"Cluster count matrix — {target}")
     if sticky_cluster_heads:
         st.warning(f"⚠️ {len(sticky_cluster_heads)} sticky sequence(s) found — highlighted in red")
-    else:
-        st.success("✅ No sticky sequences found in other runs")
-    preferred = ["cluster_head","control_norm","1xpanned_norm","2xpanned_norm","fold_enrichment"]
-    display_cols = [c for c in preferred if c in cm_display.columns]
-    cm_show = cm_display[display_cols].head(top_n)
-    if sticky_cluster_heads:
         st.dataframe(cm_show.style.apply(highlight_sticky_cm, axis=1), use_container_width=True)
+    elif sticky_ever_run:
+        st.success("✅ No sticky sequences found in other runs")
+        st.dataframe(cm_show, use_container_width=True)
     else:
         st.dataframe(cm_show, use_container_width=True)
     st.download_button("Download count matrix CSV",
@@ -2784,6 +3449,12 @@ def page_enrichment(conn: sqlite3.Connection):
                     return ["background-color: #fce8e8; color: #666666"] * len(row)
                 return [""] * len(row)
 
+            def _highlight_sticky_seq_trim(row):
+                ch = row.get("cluster_head", "")
+                if ch in trimmed_sticky_heads:
+                    return ["background-color: #fce8e8; color: #666666"] * len(row)
+                return [""] * len(row)
+
             st.dataframe(
                 display_df.style.apply(_highlight_sticky_seq, axis=1),
                 use_container_width=True
@@ -2810,6 +3481,68 @@ def page_enrichment(conn: sqlite3.Connection):
                 with st.expander("FASTA text (manual copy fallback)"):
                     st.text_area("FASTA", value=fasta_text, height=220)
 
+
+
+
+
+    st.divider()
+    # Trimmed sticky view
+    with st.expander("View with trimmed sticky analysis", expanded=False):
+        # Check what trim values have been run for this specific target
+        trim_vals_enr = sql_df(conn,
+            "SELECT DISTINCT trim_start FROM sticky_sequences_trimmed WHERE run_id=? AND target=? ORDER BY trim_start",
+            (run_id, target))
+        # Also check cache for runs that completed but found 0 sticky
+        trim_vals_cache = sql_df(conn,
+            "SELECT DISTINCT trim_start FROM sticky_cache WHERE run_id=? AND target=? AND trim_start > 0 ORDER BY trim_start",
+            (run_id, target))
+        all_trim_vals = sorted(set(
+            trim_vals_enr["trim_start"].tolist() +
+            trim_vals_cache["trim_start"].tolist()
+        ))
+
+        if not all_trim_vals:
+            st.info("No trimmed sticky analysis available.")
+        else:
+            selected_trim_enr = st.selectbox(
+                "Select trim value",
+                all_trim_vals,
+                format_func=lambda x: f"{x} AA trim",
+                key=f"trim_enr_select_{run_id}_{target}"
+            )
+
+            # Get sticky cluster heads for this run/target/trim
+            trim_sticky_df = sql_df(conn,
+                "SELECT DISTINCT cluster_head FROM sticky_sequences_trimmed WHERE run_id=? AND target=? AND trim_start=?",
+                (run_id, target, selected_trim_enr))
+            trim_sticky_heads = set(trim_sticky_df["cluster_head"].tolist()) if not trim_sticky_df.empty else set()
+
+            def highlight_trim_cm(row):
+                if row.get("cluster_head") in trim_sticky_heads:
+                    return ["background-color: #fce8e8; color: #666666"] * len(row)
+                return [""] * len(row)
+
+            def highlight_trim_seq(row):
+                if row.get("cluster_head") in trim_sticky_heads:
+                    return ["background-color: #fce8e8; color: #666666"] * len(row)
+                return [""] * len(row)
+
+            # Count matrix
+            st.subheader(f"Cluster count matrix — {target} (trimmed {selected_trim_enr} AA)")
+            n_sticky_trim_enr = len([ch for ch in cm_display["cluster_head"].head(top_n) if ch in trim_sticky_heads])
+            if n_sticky_trim_enr:
+                st.warning(f"⚠️ {n_sticky_trim_enr} sticky sequence(s) found with {selected_trim_enr} AA trim — highlighted in red")
+                st.dataframe(cm_show.style.apply(highlight_trim_cm, axis=1), use_container_width=True)
+            else:
+                st.success(f"✅ No sticky sequences found with {selected_trim_enr} AA trim")
+                st.dataframe(cm_show, use_container_width=True)
+
+            # Sequence table
+            st.subheader(f"Top {top_n} sequences (trimmed {selected_trim_enr} AA)")
+            st.dataframe(
+                display_df.style.apply(highlight_trim_seq, axis=1),
+                use_container_width=True
+            )
 
     st.divider()
     # MSA panel 
@@ -3357,13 +4090,15 @@ def main():
     db_path = Path(st.session_state["db_path_str"]).expanduser()
     conn = connect_db(db_path)
 
-    page = st.sidebar.radio("Page", ["Overview", "Enrichment", "Sticky Sequences", "Ingest"])
+    page = st.sidebar.radio("Page", ["Overview", "Enrichment", "Sticky Sequences", "Visualization", "Ingest"])
     if page == "Overview":
         page_overview(conn)
     elif page == "Enrichment":
         page_enrichment(conn)
     elif page == "Sticky Sequences":
         page_sticky(conn)
+    elif page == "Visualization":
+        page_visualization(conn)
     elif page == "Ingest":
         page_ingest(conn, db_path)
 
