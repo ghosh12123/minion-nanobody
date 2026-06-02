@@ -2534,7 +2534,6 @@ def page_visualization(conn: sqlite3.Connection):
 
     # ── PCA Analysis (Matthias approach: AA composition per sequence)
     st.subheader("PCA — top 100 enriched sequences per target")
-    st.caption("Each point is one nanobody sequence. Features are amino acid composition (or dipeptide k-mers). Colored by target, run, sticky flag, or fold enrichment.")
 
     try:
         from sklearn.decomposition import PCA
