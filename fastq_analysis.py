@@ -37,6 +37,7 @@ from Bio.SeqRecord import SeqRecord
 import matplotlib.colors as mcolors
 from plotly.subplots import make_subplots
 
+
 # -----------------------------
 # Helpers (folders / names)
 # -----------------------------
@@ -489,7 +490,7 @@ def plot_library_abundance_distribution(
     except Exception:
         pass
 
-    fig, ax = plt.subplots(figsize=(5, 5))
+    fig, ax = plt.subplots(figsize=(3, 3))
     if not plot_data_abundance.empty:
         for lib_id, df_lib in plot_data_abundance.groupby("library_id"):
             ax.plot(df_lib["x"], df_lib["y"], linewidth=1.9, label=lib_id)
@@ -1191,7 +1192,7 @@ def msa_to_colored_html(
 
     lines: list[str] = []
 
-    # Single-row mode (no wrapping; horizontal scroll)
+    # Single-row mode (no wrapping; horizontal scroll) 
     if block_size is None or int(block_size) <= 0:
         for sid, s in zip(ids, seqs):
             sid_pad = sid.ljust(name_w)
@@ -1637,7 +1638,7 @@ def sql_df(conn: sqlite3.Connection, sql: str, params=()) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# INGEST — whole run, one target at a time
+# INGEST — whole run, one target at a time 
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _compute_target(args: dict) -> dict:
@@ -2236,7 +2237,7 @@ def page_sticky(conn: sqlite3.Connection):
 
         c1, c2 = st.columns(2)
         c1.metric("Total sticky records", f"{len(df_s):,}")
-        n_unique = df_s[["run_id","target","cluster_head"]].drop_duplicates().shape[0]
+        n_unique = df_s["cluster_head"].nunique()
         c2.metric("Unique sticky sequences", f"{n_unique:,}")
 
         summary = (df_s.groupby(["run_name", "target", "cluster_head"])
@@ -2534,6 +2535,7 @@ def page_visualization(conn: sqlite3.Connection):
 
     # ── PCA Analysis (Matthias approach: AA composition per sequence)
     st.subheader("PCA — top 100 enriched sequences per target")
+    st.caption("Each point is one nanobody sequence. Features are amino acid composition. Colored by target.")
 
     try:
         from sklearn.decomposition import PCA
@@ -2796,6 +2798,28 @@ def page_overview(conn: sqlite3.Connection):
         (run_id,))
     if not targets.empty:
         st.dataframe(targets, use_container_width=True)
+
+    st.divider()
+    st.subheader("Rename runs")
+    st.caption("Set a custom display name for any run. The original run ID is unchanged.")
+    for _, row in runs.iterrows():
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            new_name = st.text_input(
+                f"{row['sample_id']}",
+                value=row["sample_id"],
+                key=f"rename_{row['run_id']}"
+            )
+        with col2:
+            st.write("")
+            st.write("")
+            if st.button("Save", key=f"rename_btn_{row['run_id']}"):
+                if new_name.strip() and new_name.strip() != row["sample_id"]:
+                    with conn:
+                        conn.execute("UPDATE run SET sample_id=? WHERE run_id=?",
+                            (new_name.strip(), row["run_id"]))
+                    st.success(f"Renamed to: {new_name.strip()}")
+                    st.rerun()
 
 
 def generate_enrichment_pdf(
@@ -3109,7 +3133,8 @@ def page_enrichment(conn: sqlite3.Connection):
             if (r["control_norm"] is not None and float(r["control_norm"]) > 0) else None,
             axis=1
         )
-        cm_display = cm_display.sort_values("fold_enrichment", ascending=False, na_position="last")
+        cm_display["_r1"] = pd.to_numeric(cm_display.get("1xpanned_norm", 0), errors="coerce").fillna(0)
+        cm_display = cm_display.sort_values(["fold_enrichment", "_r1"], ascending=[False, False], na_position="last").drop(columns=["_r1"])
 
     # Compute sticky sequences early so we can highlight both tables
     sticky_mode = "percent"
@@ -3130,7 +3155,7 @@ def page_enrichment(conn: sqlite3.Connection):
             key="sticky_thresh_global"
         )
     with col_s2:
-        trim_options = ["None (untrimmed only)", "1 AA", "2 AA", "3 AA", "4 AA", "5 AA"]
+        trim_options = ["None (untrimmed only)", "1 AA", "2 AA", "3 AA", "4 AA", "5 AA", "6 AA", "7 AA", "8 AA", "9 AA", "10 AA", "11 AA", "12 AA", "13 AA", "14 AA", "15 AA"]
         trim_choice = st.selectbox(
             "Also run trimmed analysis",
             trim_options,
@@ -3693,7 +3718,7 @@ def page_enrichment(conn: sqlite3.Connection):
             fig_abund, _ = plot_library_abundance_distribution(
                 cluster_counts_long,
                 out_pdf=Path(tmp)/"a.pdf", out_tsv=Path(tmp)/"a.tsv")
-        st.pyplot(fig_abund, clear_figure=False)
+        st.pyplot(fig_abund, clear_figure=False, use_container_width=False)
 
     st.divider()
 
