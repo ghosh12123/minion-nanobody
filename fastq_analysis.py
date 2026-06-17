@@ -1223,7 +1223,7 @@ def msa_to_colored_html(
         </html>
         """
 
-    # --- Original block mode (wrapped into blocks) ---
+    # Original block mode (wrapped into blocks) 
     for start in range(0, L, int(block_size)):
         end = min(L, start + int(block_size))
         for sid, s in zip(ids, seqs):
@@ -1638,7 +1638,7 @@ def sql_df(conn: sqlite3.Connection, sql: str, params=()) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# INGEST — whole run, one target at a time 
+# INGEST — whole run, one target at a time
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _compute_target(args: dict) -> dict:
@@ -2135,52 +2135,85 @@ def find_sticky_sequences(
     if not ch_to_trimmed:
         return {}
 
-    # Get all other runs
+    # Get all other run ids and names
     other_runs = sql_df(conn, "SELECT run_id, sample_id FROM run WHERE run_id != ?", (run_id,))
     if other_runs.empty:
         return {}
 
+    run_name_map = dict(zip(other_runs["run_id"], other_runs["sample_id"]))
+    other_run_ids = other_runs["run_id"].tolist()
+    other_run_ph = ",".join(["?"] * len(other_run_ids))
+
     results: Dict[str, List[dict]] = {}
+    query_trimmed_set = set(ch_to_trimmed.values())
 
-    # For each other run, fetch raw sequences and check for matches
-    for _, other_run in other_runs.iterrows():
-        other_run_id = other_run["run_id"]
-        other_run_name = other_run["sample_id"]
-
+    if trim_start == 0:
+        # Fast path: exact SQL match using index on aa_sequence 
+        seq_ph = ",".join(["?"] * len(query_trimmed_set))
+        query_trimmed_list = list(query_trimmed_set)
         raw = sql_df(conn,
-            "SELECT aa_sequence, target, barcode, read_count FROM raw_sequences WHERE run_id=?",
-            (other_run_id,))
+            f"SELECT aa_sequence, run_id, target, barcode, read_count FROM raw_sequences "
+            f"WHERE run_id IN ({other_run_ph}) AND aa_sequence IN ({seq_ph})",
+            (*other_run_ids, *query_trimmed_list))
 
         if raw.empty:
-            continue
+            return {}
 
-        # Trim raw sequences
+        # Reverse map: trimmed_seq -> cluster_head
+        trimmed_to_ch = {v: k for k, v in ch_to_trimmed.items()}
+
+        for _, rrow in raw.iterrows():
+            ch = trimmed_to_ch.get(rrow["aa_sequence"])
+            if not ch:
+                continue
+            if ch not in results:
+                results[ch] = []
+            results[ch].append({
+                "run_id": rrow["run_id"],
+                "run_name": run_name_map.get(rrow["run_id"], rrow["run_id"][:8]),
+                "target": rrow["target"],
+                "barcode": rrow["barcode"],
+                "read_count": int(rrow["read_count"]),
+            })
+
+    else:
+        # Trimmed path: length pre-filter then trim in Python 
+        # Query lengths are already trimmed, raw sequences are full length
+        trimmed_lengths = [len(s) for s in query_trimmed_set if s]
+        if not trimmed_lengths:
+            return {}
+        # Raw sequence length = trimmed length + trim_start
+        min_raw_len = min(trimmed_lengths) + trim_start - 2
+        max_raw_len = max(trimmed_lengths) + trim_start + 2
+
+        raw = sql_df(conn,
+            f"SELECT aa_sequence, run_id, target, barcode, read_count FROM raw_sequences "
+            f"WHERE run_id IN ({other_run_ph}) AND aa_length BETWEEN ? AND ?",
+            (*other_run_ids, min_raw_len, max_raw_len))
+
+        if raw.empty:
+            return {}
+
+        # Trim raw sequences and match
+        trimmed_to_ch = {v: k for k, v in ch_to_trimmed.items()}
         raw["aa_trimmed"] = raw["aa_sequence"].apply(
             lambda s: s[trim_start:] if s and len(s) > trim_start else s
         )
+        matches = raw[raw["aa_trimmed"].isin(query_trimmed_set)]
 
-        # Build lookup: trimmed_seq -> list of (target, barcode, read_count)
-        trimmed_lookup = {}
-        for _, rrow in raw.iterrows():
-            t = rrow["aa_trimmed"]
-            if t:
-                if t not in trimmed_lookup:
-                    trimmed_lookup[t] = []
-                trimmed_lookup[t].append((rrow["target"], rrow["barcode"], int(rrow["read_count"])))
-
-        # Check each cluster head
-        for ch, trimmed_query in ch_to_trimmed.items():
-            if trimmed_query in trimmed_lookup:
-                for (other_target, other_barcode, other_read_count) in trimmed_lookup[trimmed_query]:
-                    if ch not in results:
-                        results[ch] = []
-                    results[ch].append({
-                        "run_id": other_run_id,
-                        "run_name": other_run_name,
-                        "target": other_target,
-                        "barcode": other_barcode,
-                        "read_count": other_read_count,
-                    })
+        for _, rrow in matches.iterrows():
+            ch = trimmed_to_ch.get(rrow["aa_trimmed"])
+            if not ch:
+                continue
+            if ch not in results:
+                results[ch] = []
+            results[ch].append({
+                "run_id": rrow["run_id"],
+                "run_name": run_name_map.get(rrow["run_id"], rrow["run_id"][:8]),
+                "target": rrow["target"],
+                "barcode": rrow["barcode"],
+                "read_count": int(rrow["read_count"]),
+            })
 
     return results
 
@@ -2259,7 +2292,7 @@ def page_sticky(conn: sqlite3.Connection):
         st.download_button(f"Download CSV", df_s[display_cols].to_csv(index=False).encode(),
                            download_filename, "text/csv", key=f"dl_{download_filename}")
 
-    # ── AA search
+    # AA search
     st.subheader("Search for amino acid sequence")
     search_aa = st.text_input("Paste an amino acid sequence to check if it appears in sticky sequences",
                                placeholder="MAGPAGAA...", key="sticky_aa_search")
@@ -2287,21 +2320,18 @@ def page_sticky(conn: sqlite3.Connection):
 
     st.divider()
 
-    # ── Filters (shared between untrimmed section)
-    col1, col2 = st.columns(2)
-    with col1:
-        runs = sql_df(conn, "SELECT DISTINCT run_id FROM sticky_sequences")
-        run_labels = {}
-        for rid in runs["run_id"]:
-            r = conn.execute("SELECT sample_id FROM run WHERE run_id=?", (rid,)).fetchone()
-            run_labels[rid] = r[0] if r else rid[:8]
-        selected_run = st.selectbox("Filter by run",
-            ["All"] + runs["run_id"].tolist(),
-            format_func=lambda x: "All" if x == "All" else run_labels.get(x, x))
-    with col2:
-        sim_filter = st.slider("Min similarity threshold", 0.80, 1.0, 0.90, 0.01, format="%.2f")
+    # Filters
+    sim_filter = 1.0
+    runs = sql_df(conn, "SELECT DISTINCT run_id FROM sticky_sequences")
+    run_labels = {}
+    for rid in runs["run_id"]:
+        r = conn.execute("SELECT sample_id FROM run WHERE run_id=?", (rid,)).fetchone()
+        run_labels[rid] = r[0] if r else rid[:8]
+    selected_run = st.selectbox("Filter by run",
+        ["All"] + runs["run_id"].tolist(),
+        format_func=lambda x: "All" if x == "All" else run_labels.get(x, x))
 
-    # ── Untrimmed section
+    # Untrimmed section
     if selected_run == "All":
         df_ut = sql_df(conn,
             "SELECT * FROM sticky_sequences WHERE similarity >= ? ORDER BY flagged_at DESC",
@@ -2313,7 +2343,7 @@ def page_sticky(conn: sqlite3.Connection):
 
     render_sticky_section(df_ut, conn, "Untrimmed sticky sequences", "sticky_untrimmed.csv")
 
-    # ── Trimmed section
+    # Trimmed section
     st.divider()
 
     trim_vals = sql_df(conn, "SELECT DISTINCT trim_start FROM sticky_sequences_trimmed ORDER BY trim_start")
@@ -2392,7 +2422,7 @@ def page_sticky(conn: sqlite3.Connection):
                 else:
                     st.info("Could not retrieve prefix data.")
 
-    # ── Global trimmed analysis at the bottom
+    # Global trimmed analysis at the bottom
 def page_visualization(conn: sqlite3.Connection):
     st.header("Data Visualization")
     st.caption("Absolute and normalized counts across all runs and targets.")
@@ -2445,7 +2475,7 @@ def page_visualization(conn: sqlite3.Connection):
                               horizontal=True)
         normalize = norm_mode.startswith("Normalized")
 
-    # ── Total reads per barcode
+    # Total reads per barcode
     st.subheader("Total reads per barcode")
     if normalize:
         # Show each barcode as % of total reads in that run
@@ -2478,7 +2508,7 @@ def page_visualization(conn: sqlite3.Connection):
             )
             st.plotly_chart(fig_reads, use_container_width=True)
 
-            # ── Sequences passing filter
+            # Sequences passing filter
             st.subheader("Sequences passing filter")
             if normalize:
                 total = df["total_reads_control"] + df["total_reads_1xpanned"] + df["total_reads_2xpanned"]
@@ -2502,7 +2532,7 @@ def page_visualization(conn: sqlite3.Connection):
             )
             st.plotly_chart(fig_filtered, use_container_width=True)
 
-            # ── Number of clusters
+            # Number of clusters
             st.subheader("Number of clusters")
             fig_clusters = go.Figure(go.Bar(
                 x=df["label"], y=df["n_clusters"],
@@ -2516,7 +2546,7 @@ def page_visualization(conn: sqlite3.Connection):
             )
             st.plotly_chart(fig_clusters, use_container_width=True)
 
-            # ── Summary table (inside show_charts)
+            # Summary table (inside show_charts)
             with st.expander("Raw data table"):
                 st.dataframe(df[["sample_id", "target", "total_reads_control",
                                   "total_reads_1xpanned", "total_reads_2xpanned",
@@ -2533,7 +2563,7 @@ def page_visualization(conn: sqlite3.Connection):
                         "total_reads_2xpanned","kept_filtered","n_clusters"]].to_csv(index=False).encode(),
                     "visualization_data.csv", "text/csv")
 
-    # ── PCA Analysis (Matthias approach: AA composition per sequence)
+    # PCA Analysis 
     st.subheader("PCA — top 100 enriched sequences per target")
     st.caption("Each point is one nanobody sequence. Features are amino acid composition. Colored by target.")
 
@@ -2550,7 +2580,7 @@ def page_visualization(conn: sqlite3.Connection):
         l = max(len(seq), 1)
         return [seq.count(aa) / l for aa in AMINO_ACIDS]
 
-    # Step 1: select runs and targets before running PCA
+    # Select runs and targets before running PCA
     all_runs = sql_df(conn, "SELECT run_id, sample_id FROM run ORDER BY sample_id")
     run_options = dict(zip(all_runs["sample_id"], all_runs["run_id"]))
 
@@ -2566,7 +2596,7 @@ def page_visualization(conn: sqlite3.Connection):
         return
     selected_run_ids = [run_options[r] for r in selected_run_names]
 
-    # Step 2: select targets within those runs
+    # Select targets within those runs
     placeholders_runs_pre = ",".join(["?"]*len(selected_run_ids))
     available_targets = sql_df(conn,
         f"SELECT DISTINCT target FROM target_run WHERE run_id IN ({placeholders_runs_pre}) ORDER BY target",
@@ -2777,9 +2807,6 @@ def page_visualization(conn: sqlite3.Connection):
     st.caption("Each dot is one nanobody sequence. Dashed ellipses show the 95% confidence region for each target. Sequences closer together have more similar amino acid compositions.")
 
 
-
-
-
 def page_overview(conn: sqlite3.Connection):
     st.header("Overview")
     runs = sql_df(conn,
@@ -2859,7 +2886,7 @@ def generate_enrichment_pdf(
     normal_style = styles["Normal"]
     small_style = ParagraphStyle("small", parent=styles["Normal"], fontSize=8)
 
-    # ── Title
+    # Title
     run_info = conn.execute("SELECT sample_id FROM run WHERE run_id=?", (run_id,)).fetchone()
     sample_id = run_info[0] if run_info else run_id[:8]
     story.append(Paragraph(f"Nanobody Enrichment Report", title_style))
@@ -2867,7 +2894,7 @@ def generate_enrichment_pdf(
     story.append(Paragraph(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", small_style))
     story.append(Spacer(1, 12))
 
-    # ── Ingest parameters
+    # Ingest parameters
     story.append(Paragraph("Ingest Parameters", heading_style))
     run_params = conn.execute(
         "SELECT start_anchor, end_anchor, min_aa_len, mm_min_seq_id, mm_coverage, use_linclust FROM run WHERE run_id=?",
@@ -2891,7 +2918,7 @@ def generate_enrichment_pdf(
         story.append(param_table)
     story.append(Spacer(1, 10))
 
-    # ── Analysis thresholds
+    # Analysis thresholds
     story.append(Paragraph("Analysis Thresholds", heading_style))
     thresh_data = [
         ["Baseline Threshold (control_norm)", "Enrichment Threshold (fold)"],
@@ -2910,7 +2937,7 @@ def generate_enrichment_pdf(
     story.append(thresh_table)
     story.append(Spacer(1, 10))
 
-    # ── Target QC stats
+    # Target QC stats
     story.append(Paragraph("Target Statistics", heading_style))
     tr = conn.execute(
         "SELECT total_reads_control, total_reads_1xpanned, total_reads_2xpanned, kept_filtered, n_clusters FROM target_run WHERE run_id=? AND target=?",
@@ -2933,7 +2960,7 @@ def generate_enrichment_pdf(
         story.append(qc_table)
     story.append(Spacer(1, 10))
 
-    # ── Sticky summary
+    # Sticky summary
     n_sticky = len(sticky_map)
     sticky_color = colors.HexColor("#fce8e8") if n_sticky > 0 else colors.HexColor("#d4edda")
     sticky_text = f"Sticky sequences: {n_sticky} flagged (appear in other runs at {100}% identity)"
@@ -2941,7 +2968,7 @@ def generate_enrichment_pdf(
                                                          backColor=sticky_color, borderPad=4)))
     story.append(Spacer(1, 10))
 
-    # ── Differential abundance plot
+    # Differential abundance plot
     story.append(Paragraph("Differential Abundance Plot", heading_style))
     if diff_fig is not None:
         try:
@@ -2954,7 +2981,7 @@ def generate_enrichment_pdf(
             story.append(Paragraph("(Plot could not be rendered)", small_style))
     story.append(Spacer(1, 10))
 
-    # ── Abundance distribution plot
+    # Abundance distribution plot
     story.append(Paragraph("Abundance Distribution by Library", heading_style))
     if abund_fig is not None:
         try:
@@ -2967,7 +2994,7 @@ def generate_enrichment_pdf(
             story.append(Paragraph("(Plot could not be rendered)", small_style))
     story.append(Spacer(1, 10))
 
-    # ── Count matrix table (top 30)
+    # Count matrix table (top 30)
     story.append(PageBreak())
     story.append(Paragraph(f"Top Clusters by Fold Enrichment", heading_style))
 
@@ -3002,7 +3029,7 @@ def generate_enrichment_pdf(
     story.append(cm_table)
     story.append(Spacer(1, 10))
 
-    # ── Top sequences
+    # Top sequences
     story.append(PageBreak())
     story.append(Paragraph("Top Cluster Amino Acid Sequences", heading_style))
     top_ids = cm_display["cluster_head"].astype(str).head(30).tolist()
@@ -3092,7 +3119,7 @@ def page_enrichment(conn: sqlite3.Connection):
         enrichment_threshold = st.number_input("Enrichment threshold (fold)", min_value=0.0001,
                                                 value=DEFAULT_ENRICHMENT_THRESHOLD, step=1.0)
 
-    # PDF export placeholder — above all sliders
+    # PDF export placeholder 
     pdf_placeholder = st.empty()
 
     show_sequences = st.checkbox("Show top cluster amino-acid sequences", value=True)
@@ -3136,7 +3163,7 @@ def page_enrichment(conn: sqlite3.Connection):
         cm_display["_r1"] = pd.to_numeric(cm_display.get("1xpanned_norm", 0), errors="coerce").fillna(0)
         cm_display = cm_display.sort_values(["fold_enrichment", "_r1"], ascending=[False, False], na_position="last").drop(columns=["_r1"])
 
-    # Compute sticky sequences early so we can highlight both tables
+    # Compute sticky sequences early to highlight both tables
     sticky_mode = "percent"
 
     top_ids = cm_display["cluster_head"].astype(str).head(top_n).tolist()
@@ -3145,25 +3172,19 @@ def page_enrichment(conn: sqlite3.Connection):
     import json as _json
 
     # Sticky detection controls
-    col_s1, col_s2, col_s3 = st.columns([2, 2, 1])
-    with col_s1:
-        sticky_threshold = st.slider(
-            "Sticky similarity threshold",
-            min_value=0.80, max_value=1.0,
-            value=st.session_state.get("sticky_thresh_global", 1.0),
-            step=0.01, format="%.2f",
-            key="sticky_thresh_global"
-        )
+    sticky_threshold = 1.0
+    col_s2, col_s3 = st.columns([3, 1])
     with col_s2:
-        trim_options = ["None (untrimmed only)", "1 AA", "2 AA", "3 AA", "4 AA", "5 AA", "6 AA", "7 AA", "8 AA", "9 AA", "10 AA", "11 AA", "12 AA", "13 AA", "14 AA", "15 AA"]
-        trim_choice = st.selectbox(
+        trim_choices = st.multiselect(
             "Also run trimmed analysis",
-            trim_options,
-            index=st.session_state.get("sticky_trim_choice_idx", 0),
-            key="sticky_trim_choice"
+            options=list(range(3, 16)),
+            default=st.session_state.get("sticky_trim_choices", []),
+            format_func=lambda x: f"{x} AA",
+            key="sticky_trim_choices_ms",
+            placeholder="Select trim value(s)..."
         )
-        sticky_trim_start = 0 if trim_choice == "None (untrimmed only)" else int(trim_choice.split()[0])
-        st.session_state["sticky_trim_choice_idx"] = trim_options.index(trim_choice)
+        st.session_state["sticky_trim_choices"] = trim_choices
+        sticky_trim_start = trim_choices[0] if trim_choices else 0
     with col_s3:
         st.write("")
         st.write("")
@@ -3303,11 +3324,11 @@ def page_enrichment(conn: sqlite3.Connection):
 
     if not other_runs.empty:
         if run_sticky_btn:
-            sticky_map = run_sticky_detection(trim=0)
-            if sticky_trim_start > 0:
-                trimmed_sticky_map = run_sticky_detection(trim=sticky_trim_start)
-            else:
-                trimmed_sticky_map = {}
+            with st.spinner(f"Running sticky detection (untrimmed + {len(trim_choices)} trim value(s))..."):
+                sticky_map = run_sticky_detection(trim=0)
+                for _trim_val in trim_choices:
+                    run_sticky_detection(trim=_trim_val)
+            trimmed_sticky_map = run_sticky_detection(trim=trim_choices[0]) if trim_choices else {}
         else:
             # Load existing results from DB without computing
             sticky_map = run_sticky_detection(trim=0) if False else {}
@@ -3432,7 +3453,7 @@ def page_enrichment(conn: sqlite3.Connection):
             show_aa = True
 
         if aa_map or nt_map:
-            # sticky_map already computed above
+            # Sticky_map already computed above
 
             # Build display dataframe
             display_rows = []
@@ -3708,7 +3729,7 @@ def page_enrichment(conn: sqlite3.Connection):
                         st.error(f"MSA failed: {e}")
 
 
-    # Abundance distribution 
+    # Abundance distribution
     st.subheader("Abundance distribution by library")
     cluster_counts_long = sql_df(conn,
         "SELECT library_id, cluster_head, raw_count as n FROM cluster_counts WHERE run_id=? AND target=?",
@@ -3875,7 +3896,7 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
         mm_coverage   = st.number_input("coverage",   0.0, 1.0, 0.90, 0.01, format="%.2f")
         mm_cov_mode   = st.number_input("cov_mode",   0, 5, 0, 1)
 
-    # ── External library overrides ──────────────────────────────────────────────
+    # External library overrides
     st.divider()
     st.subheader("External library overrides (optional)")
     st.caption(
@@ -3970,7 +3991,7 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
 
     # Final preview table — reflects skips and overrides
     if folder_path.strip() and 'groups' in dir():
-        pass  # groups already in scope from preview section above
+        pass  # Groups already in scope from preview section above
     if folder_path.strip():
         try:
             _p = Path(folder_path.strip()).expanduser()
