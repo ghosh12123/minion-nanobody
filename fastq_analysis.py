@@ -37,7 +37,6 @@ from Bio.SeqRecord import SeqRecord
 import matplotlib.colors as mcolors
 from plotly.subplots import make_subplots
 
-
 # -----------------------------
 # Helpers (folders / names)
 # -----------------------------
@@ -1339,8 +1338,6 @@ def plot_msa_heatmap_plotly(
     return fig
 
 
-# -----------------------------
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # BARCODE FOLDER PARSING
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1369,8 +1366,8 @@ def discover_barcodes(folder: Path) -> List[dict]:
     """
     Discover all barcode folders or FASTQ files in a run directory.
     Supports two layouts:
-      1. Subfolders per barcode: barcode13_CD98_TG1/reads.fastq.gz  (standard)
-      2. Flat FASTQ files:       barcode13_CD98_TG1.fastq.gz        (Matthias-style)
+      1. Subfolders per barcode: barcode13_CD98_TG1/reads.fastq.gz  
+      2. Flat FASTQ files:       barcode13_CD98_TG1.fastq.gz       
     """
     results = []
     scan_dir = folder / "fastq_pass" if (folder / "fastq_pass").exists() else folder
@@ -1462,7 +1459,7 @@ DEFAULT_DB                   = "~/minion_nanobody.db"
 DEFAULT_START                = "ATGGCC"
 DEFAULT_END                  = "GGCGCGC"
 DEFAULT_LENGTH               = 80
-DEFAULT_BASELINE_THRESHOLD   = 100
+DEFAULT_BASELINE_THRESHOLD   = 0
 DEFAULT_ENRICHMENT_THRESHOLD = 10.0
 
 SCHEMA_SQL = """
@@ -1959,7 +1956,6 @@ def _write_target_to_db(conn: sqlite3.Connection, result: dict):
         )
 
 
-
 def ingest_run(
     fastq_dir: Path,
     db_path: Path,
@@ -2148,7 +2144,7 @@ def find_sticky_sequences(
     query_trimmed_set = set(ch_to_trimmed.values())
 
     if trim_start == 0:
-        # Fast path: exact SQL match using index on aa_sequence 
+        # Fast path: exact SQL match using index on aa_sequence
         seq_ph = ",".join(["?"] * len(query_trimmed_set))
         query_trimmed_list = list(query_trimmed_set)
         raw = sql_df(conn,
@@ -2177,7 +2173,7 @@ def find_sticky_sequences(
             })
 
     else:
-        # Trimmed path: length pre-filter then trim in Python 
+        # Trimmed path: length pre-filter then trim in Python
         # Query lengths are already trimmed, raw sequences are full length
         trimmed_lengths = [len(s) for s in query_trimmed_set if s]
         if not trimmed_lengths:
@@ -2563,24 +2559,91 @@ def page_visualization(conn: sqlite3.Connection):
                         "total_reads_2xpanned","kept_filtered","n_clusters"]].to_csv(index=False).encode(),
                     "visualization_data.csv", "text/csv")
 
-    # PCA Analysis 
+    # PCA Analysis (AA composition per sequence)
     st.subheader("PCA — top 100 enriched sequences per target")
     st.caption("Each point is one nanobody sequence. Features are amino acid composition. Colored by target.")
 
     try:
         from sklearn.decomposition import PCA
         from sklearn.preprocessing import StandardScaler
+        try:
+            from anarci import anarci as _anarci
+            ANARCI_AVAILABLE = True
+        except ImportError:
+            ANARCI_AVAILABLE = False
     except ImportError:
         st.warning("scikit-learn is required for PCA. Install with: `pip install scikit-learn`")
         return
 
     AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
 
+    # IMGT CDR positions for VHH nanobodies
+    _IMGT_CDR1 = set(range(27, 39))
+    _IMGT_CDR2 = set(range(56, 66))
+    _IMGT_CDR3 = set(range(105, 118))
+
+    def extract_cdrs_imgt(seq):
+        """Extract CDR1+CDR2+CDR3 residues using ANARCI IMGT numbering.
+        Strips common VHH N-terminal prefixes before annotating.
+        Uses a Windows-safe temp file workaround."""
+        import re as _re
+        import tempfile as _tempfile
+        import os as _os
+        import time as _time
+        try:
+            match = _re.search(r'[QEKD]V[QL]', seq)
+            clean_seq = seq[match.start():] if match else seq
+
+            # Monkey-patch os.remove to retry on Windows file locking errors
+            _orig_remove = _os.remove
+            def _safe_remove(path):
+                for _ in range(10):
+                    try:
+                        _orig_remove(path)
+                        return
+                    except OSError:
+                        _time.sleep(0.05)
+            _os.remove = _safe_remove
+
+            # Find hmmscan — check conda and common Windows locations
+            import shutil as _shutil
+            hmmerpath = None
+            for _candidate in [
+                _os.path.expanduser("~/miniconda3/bin"),
+                _os.path.expanduser("~/miniconda3/Library/bin"),
+                _os.path.expanduser("~/miniconda3/Scripts"),
+                _os.path.expanduser("~/miniconda3/envs/base/bin"),
+                "C:/ProgramData/miniconda3/bin",
+                "C:/ProgramData/miniconda3/Library/bin",
+            ]:
+                if _shutil.which("hmmscan", path=_candidate):
+                    hmmerpath = _candidate
+                    break
+            if hmmerpath is None:
+                hmmerpath = ""  # let ANARCI find it itself
+            try:
+                results = _anarci([("s", clean_seq)], scheme="imgt", output=False, ncpu=1,
+                                   hmmerpath=hmmerpath)
+            finally:
+                _os.remove = _orig_remove
+
+            numbered, _, _ = results
+            if not numbered[0]:
+                return None
+            positions = numbered[0][0][0]
+            cdr_residues = "".join(
+                aa for (pos, _), aa in positions
+                if pos in (_IMGT_CDR1 | _IMGT_CDR2 | _IMGT_CDR3) and aa != "-"
+            )
+            return cdr_residues if cdr_residues else None
+        except Exception as _e:
+            return f"ERROR:{_e}"
+
     def aa_composition(seq):
         l = max(len(seq), 1)
         return [seq.count(aa) / l for aa in AMINO_ACIDS]
 
-    # Select runs and targets before running PCA
+    # Step 1: select runs and targets before running PCA
     all_runs = sql_df(conn, "SELECT run_id, sample_id FROM run ORDER BY sample_id")
     run_options = dict(zip(all_runs["sample_id"], all_runs["run_id"]))
 
@@ -2596,7 +2659,7 @@ def page_visualization(conn: sqlite3.Connection):
         return
     selected_run_ids = [run_options[r] for r in selected_run_names]
 
-    # Select targets within those runs
+    # Step 2: select targets within those runs
     placeholders_runs_pre = ",".join(["?"]*len(selected_run_ids))
     available_targets = sql_df(conn,
         f"SELECT DISTINCT target FROM target_run WHERE run_id IN ({placeholders_runs_pre}) ORDER BY target",
@@ -2615,6 +2678,15 @@ def page_visualization(conn: sqlite3.Connection):
 
     color_by = "target"
     top_n_pca = st.slider("3. Top N sequences per target", 10, 200, 100, 10, key="pca_top_n")
+
+    pca_mode = st.radio(
+        "4. Sequence regions to use",
+        ["Full sequence", "CDRs only (IMGT)"],
+        horizontal=True,
+        key="pca_mode",
+        help="CDRs only extracts CDR1, CDR2, CDR3 using ANARCI IMGT numbering — removes framework region bias."
+    )
+    use_cdrs_only = pca_mode == "CDRs only (IMGT)"
 
     if not st.button("Run PCA", type="primary", key="run_pca_btn"):
         return
@@ -2686,9 +2758,29 @@ def page_visualization(conn: sqlite3.Connection):
     seq_df_pca = pd.DataFrame(seq_records)
     st.caption(f"{len(seq_df_pca):,} sequences from {seq_df_pca['target'].nunique()} target(s) across {seq_df_pca['run'].nunique()} run(s)")
 
+    # Optionally extract CDRs
+    if use_cdrs_only:
+        if not ANARCI_AVAILABLE:
+            st.error("ANARCI is not installed. Run: pip install anarci")
+            return
+        with st.spinner("Extracting CDR sequences (IMGT numbering)..."):
+            seq_df_pca["cdr_sequence"] = seq_df_pca["aa_sequence"].apply(extract_cdrs_imgt)
+            n_failed = seq_df_pca["cdr_sequence"].isna().sum()
+            if n_failed > 0:
+                st.warning(f"{n_failed} sequences could not be annotated and will be excluded.")
+            seq_df_pca = seq_df_pca[~seq_df_pca["cdr_sequence"].str.startswith("ERROR:", na=False)]
+            seq_df_pca = seq_df_pca.dropna(subset=["cdr_sequence"])
+            if len(seq_df_pca) < 3:
+                st.error("Not enough sequences could be annotated. Try using full sequence mode.")
+                return
+        feature_seqs = seq_df_pca["cdr_sequence"]
+        st.caption(f"Using CDR sequences only (avg length: {feature_seqs.str.len().mean():.0f} AA)")
+    else:
+        feature_seqs = seq_df_pca["aa_sequence"]
+
     # Compute features
     with st.spinner("Computing sequence features..."):
-        X = np.array([aa_composition(s) for s in seq_df_pca["aa_sequence"]])
+        X = np.array([aa_composition(s) for s in feature_seqs])
 
         X_scaled = StandardScaler().fit_transform(X)
         n_components = min(10, X_scaled.shape[0], X_scaled.shape[1])
@@ -3119,7 +3211,7 @@ def page_enrichment(conn: sqlite3.Connection):
         enrichment_threshold = st.number_input("Enrichment threshold (fold)", min_value=0.0001,
                                                 value=DEFAULT_ENRICHMENT_THRESHOLD, step=1.0)
 
-    # PDF export placeholder 
+    # PDF export placeholder — above all sliders
     pdf_placeholder = st.empty()
 
     show_sequences = st.checkbox("Show top cluster amino-acid sequences", value=True)
@@ -3163,7 +3255,7 @@ def page_enrichment(conn: sqlite3.Connection):
         cm_display["_r1"] = pd.to_numeric(cm_display.get("1xpanned_norm", 0), errors="coerce").fillna(0)
         cm_display = cm_display.sort_values(["fold_enrichment", "_r1"], ascending=[False, False], na_position="last").drop(columns=["_r1"])
 
-    # Compute sticky sequences early to highlight both tables
+    # Compute sticky sequences early so we can highlight both tables
     sticky_mode = "percent"
 
     top_ids = cm_display["cluster_head"].astype(str).head(top_n).tolist()
@@ -3390,12 +3482,38 @@ def page_enrichment(conn: sqlite3.Connection):
 
     preferred = ["cluster_head","control_norm","1xpanned_norm","2xpanned_norm","fold_enrichment"]
     display_cols = [c for c in preferred if c in cm_display.columns]
-    cm_show = cm_display[display_cols].head(top_n).copy()
+
+    # Split into sequences with control reads vs control=0
+    if "control_norm" in cm_display.columns:
+        cm_with_ctrl = cm_display[pd.to_numeric(cm_display["control_norm"], errors="coerce").fillna(0) > 0].copy()
+        cm_zero_ctrl = cm_display[pd.to_numeric(cm_display["control_norm"], errors="coerce").fillna(0) == 0].copy()
+    else:
+        cm_with_ctrl = cm_display.copy()
+        cm_zero_ctrl = pd.DataFrame(columns=cm_display.columns)
+
+    cm_show = cm_with_ctrl[display_cols].head(top_n).copy()
     for _col in ["control_norm", "1xpanned_norm", "2xpanned_norm", "fold_enrichment"]:
         if _col in cm_show.columns:
             cm_show[_col] = pd.to_numeric(cm_show[_col], errors="coerce").round(2 if _col == "fold_enrichment" else 0)
             if _col != "fold_enrichment":
                 cm_show[_col] = cm_show[_col].astype("Int64")
+
+    # Build zero-control table with epsilon-based fold enrichment for ranking
+    EPSILON = 0.001
+    if not cm_zero_ctrl.empty:
+        compare_col = "2xpanned_norm" if "2xpanned_norm" in cm_zero_ctrl.columns else (
+            "1xpanned_norm" if "1xpanned_norm" in cm_zero_ctrl.columns else None)
+        if compare_col:
+            cm_zero_ctrl["fold_enrichment"] = pd.to_numeric(cm_zero_ctrl[compare_col], errors="coerce").fillna(0) / EPSILON
+            cm_zero_ctrl = cm_zero_ctrl.sort_values("fold_enrichment", ascending=False)
+        cm_zero_show = cm_zero_ctrl[display_cols].head(top_n).copy()
+        for _col in ["control_norm", "1xpanned_norm", "2xpanned_norm"]:
+            if _col in cm_zero_show.columns:
+                cm_zero_show[_col] = pd.to_numeric(cm_zero_show[_col], errors="coerce").round(0).astype("Int64")
+        if "fold_enrichment" in cm_zero_show.columns:
+            cm_zero_show["fold_enrichment"] = pd.to_numeric(cm_zero_show["fold_enrichment"], errors="coerce").round(1)
+    else:
+        cm_zero_show = pd.DataFrame(columns=display_cols)
 
     # Check if sticky detection has been run for this target
     sticky_run = conn.execute(
@@ -3422,6 +3540,25 @@ def page_enrichment(conn: sqlite3.Connection):
     st.download_button("Download count matrix CSV",
                        cm_display[display_cols].to_csv(index=False).encode(),
                        f"{run_id[:8]}_{target}_count_matrix.csv", "text/csv")
+
+    # Separate table for sequences with 0 control reads
+    if not cm_zero_show.empty:
+        with st.expander(f"Sequences with 0 control reads ({len(cm_zero_ctrl):,} total)", expanded=False):
+            st.caption("These sequences had no reads in the control (TG1) library, so true fold enrichment is undefined. "
+                       f"Ranked here using a small epsilon ({EPSILON}) in place of 0 for the denominator — useful for seeing which "
+                       "of these are most abundant after panning, but treat the fold enrichment numbers as illustrative, not exact.")
+            def highlight_sticky_zero(row):
+                if row.get("cluster_head") in sticky_cluster_heads:
+                    return ["background-color: #fce8e8; color: #666666"] * len(row)
+                return [""] * len(row)
+            if sticky_cluster_heads:
+                st.dataframe(cm_zero_show.style.apply(highlight_sticky_zero, axis=1), use_container_width=True)
+            else:
+                st.dataframe(cm_zero_show, use_container_width=True)
+            st.download_button("Download zero-control sequences CSV",
+                               cm_zero_ctrl[display_cols].to_csv(index=False).encode(),
+                               f"{run_id[:8]}_{target}_zero_control.csv", "text/csv",
+                               key=f"dl_zero_ctrl_{run_id}_{target}")
 
 
     # Top sequences with sticky detection
@@ -3453,7 +3590,7 @@ def page_enrichment(conn: sqlite3.Connection):
             show_aa = True
 
         if aa_map or nt_map:
-            # Sticky_map already computed above
+            # sticky_map already computed above
 
             # Build display dataframe
             display_rows = []
@@ -3526,10 +3663,7 @@ def page_enrichment(conn: sqlite3.Connection):
                 with st.expander("FASTA text (manual copy fallback)"):
                     st.text_area("FASTA", value=fasta_text, height=220)
 
-
-
-
-
+                    
     st.divider()
     # Trimmed sticky view
     with st.expander("View with trimmed sticky analysis", expanded=False):
@@ -3590,7 +3724,7 @@ def page_enrichment(conn: sqlite3.Connection):
             )
 
     st.divider()
-    # MSA panel 
+    # MSA panel
     with st.expander("Multiple sequence alignment (ClustalW server)", expanded=False):
         st.caption("Submits sequences to EMBL-EBI ClustalW2. Requires internet and a valid email.")
         RUN_MSA = st.checkbox("Run MSA", value=False, key=f"run_msa_{run_id}_{target}")
@@ -3729,7 +3863,7 @@ def page_enrichment(conn: sqlite3.Connection):
                         st.error(f"MSA failed: {e}")
 
 
-    # Abundance distribution
+    # Abundance distribution 
     st.subheader("Abundance distribution by library")
     cluster_counts_long = sql_df(conn,
         "SELECT library_id, cluster_head, raw_count as n FROM cluster_counts WHERE run_id=? AND target=?",
@@ -3826,7 +3960,18 @@ def page_enrichment(conn: sqlite3.Connection):
                 enriched = enriched[show_cols].sort_values("ratio", ascending=False)
                 if not seqs_all.empty:
                     enriched = enriched.merge(seqs_all, on="cluster_head", how="left")
-                st.dataframe(enriched, use_container_width=True)
+
+                def highlight_sticky_enriched(row):
+                    if row.get("cluster_head") in sticky_cluster_heads:
+                        return ["background-color: #fce8e8; color: #666666"] * len(row)
+                    return [""] * len(row)
+
+                n_sticky_enriched = len([ch for ch in enriched["cluster_head"] if ch in sticky_cluster_heads])
+                if n_sticky_enriched:
+                    st.warning(f"⚠️ {n_sticky_enriched} of these are sticky sequences — highlighted in red")
+                    st.dataframe(enriched.style.apply(highlight_sticky_enriched, axis=1), use_container_width=True)
+                else:
+                    st.dataframe(enriched, use_container_width=True)
                 st.download_button("Download enriched candidates CSV",
                                    enriched.to_csv(index=False).encode(),
                                    f"{run_id[:8]}_{target}_enriched.csv", "text/csv")
@@ -3991,7 +4136,7 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
 
     # Final preview table — reflects skips and overrides
     if folder_path.strip() and 'groups' in dir():
-        pass  # Groups already in scope from preview section above
+        pass  # groups already in scope from preview section above
     if folder_path.strip():
         try:
             _p = Path(folder_path.strip()).expanduser()
