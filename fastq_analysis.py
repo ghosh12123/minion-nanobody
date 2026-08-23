@@ -17,7 +17,6 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
-
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -36,12 +35,6 @@ from Bio.Align import MultipleSeqAlignment
 from Bio.SeqRecord import SeqRecord
 import matplotlib.colors as mcolors
 from plotly.subplots import make_subplots
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ALL FUNCTIONS BELOW TAKEN DIRECTLY FROM Test12.py — DO NOT MODIFY LOGIC
-# ═══════════════════════════════════════════════════════════════════════════════
-
 
 # -----------------------------
 # Helpers (folders / names)
@@ -1344,8 +1337,6 @@ def plot_msa_heatmap_plotly(
     return fig
 
 
-# -----------------------------
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # BARCODE FOLDER PARSING
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1359,13 +1350,23 @@ def parse_barcode_label(folder_name: str) -> dict:
     rest = name[len(barcode):].lstrip("_")
     if not rest:
         return {"barcode": barcode, "target": "unknown", "round": 1, "label": name}
-    if re.search(r"_TG1$", rest, re.IGNORECASE) or re.match(r"^TG1$", rest, re.IGNORECASE):
+    if re.search(r"_TG1", rest, re.IGNORECASE) or re.match(r"TG1", rest, re.IGNORECASE):
         target = re.sub(r"_?TG1$", "", rest, flags=re.IGNORECASE).strip("_") or "TG1"
         return {"barcode": barcode, "target": target, "round": 0, "label": name}
+    # Try _R(\d+) at end first (standard: barcode01_CD98_R1)
     round_match = re.search(r"_R(\d+)$", rest, re.IGNORECASE)
     if round_match:
         round_num = int(round_match.group(1))
         target = rest[: round_match.start()].strip("_")
+        return {"barcode": barcode, "target": target, "round": round_num, "label": name}
+    # Try _R(\d+)_ anywhere (non-standard: barcode10_PC-1245_R2_healthy_organoids)
+    round_match_mid = re.search(r"_R(\d+)_", rest, re.IGNORECASE)
+    if round_match_mid:
+        round_num = int(round_match_mid.group(1))
+        # target = part before _R\d+_ + part after
+        before = rest[:round_match_mid.start()].strip("_")
+        after  = rest[round_match_mid.end():].strip("_")
+        target = f"{before}_{after}" if after else before
         return {"barcode": barcode, "target": target, "round": round_num, "label": name}
     return {"barcode": barcode, "target": rest, "round": 1, "label": name}
 
@@ -1421,40 +1422,42 @@ def discover_barcodes(folder: Path) -> List[dict]:
 def group_barcodes_by_target(barcodes: List[dict]) -> Dict[str, dict]:
     """
     Group barcodes by target. For each target return:
-      {target: {tg1: bc_info, rounds: {1: bc_info, 2: bc_info, ...}}}
+      {target: {tg1: [bc_info, ...], rounds: {1: [bc_info, ...], 2: [bc_info, ...], ...}}}
+    Supports multiple barcodes per round (e.g. two R1s or two TG1s).
     TG1 (round=0) matching uses prefix match for cases like C-auris_Nm -> C-auris_Nm_CW.
     """
     groups: Dict[str, dict] = {}
 
-    # First pass: collect all targets and their barcodes
+    # First pass: collect all targets and their barcodes — store lists per round
     for bc in barcodes:
         target = bc.get("target", "unknown")
         round_num = bc.get("round", 1)
         if target not in groups:
-            groups[target] = {"tg1": None, "rounds": {}}
+            groups[target] = {"tg1": [], "rounds": {}}
         if round_num == 0:
-            groups[target]["tg1"] = bc
+            groups[target]["tg1"].append(bc)
         else:
-            groups[target]["rounds"][round_num] = bc
+            if round_num not in groups[target]["rounds"]:
+                groups[target]["rounds"][round_num] = []
+            groups[target]["rounds"][round_num].append(bc)
 
     # Second pass: for targets with no TG1, try prefix match or global TG1
     tg1_barcodes = [bc for bc in barcodes if bc.get("round") == 0]
-    # A barcode named just "TG1" (target == "TG1") is a global TG1 for all targets
-    global_tg1 = next((bc for bc in tg1_barcodes if bc.get("target", "").upper() == "TG1"), None)
+    global_tg1s = [bc for bc in tg1_barcodes if bc.get("target", "").upper() == "TG1"]
     for target, grp in groups.items():
-        if grp["tg1"] is None:
+        if not grp["tg1"]:
             # Try prefix match first
             for tg1_bc in tg1_barcodes:
                 tg1_target = tg1_bc.get("target", "")
                 if tg1_target.upper() != "TG1" and target.startswith(tg1_target):
-                    grp["tg1"] = tg1_bc
+                    grp["tg1"].append(tg1_bc)
                     break
-            # Fall back to global TG1
-            if grp["tg1"] is None and global_tg1:
-                grp["tg1"] = global_tg1
+            # Fall back to global TG1s
+            if not grp["tg1"] and global_tg1s:
+                grp["tg1"].extend(global_tg1s)
 
-    # Remove targets with no rounds (pure TG1 barcodes with no panning)
-    groups = {t: g for t, g in groups.items() if g["rounds"]}
+    # Allow TG1-only targets (no panning rounds) — don't filter them out
+    # They can be used for TG1-vs-TG1 comparisons
 
     return groups
 
@@ -1523,7 +1526,7 @@ CREATE TABLE IF NOT EXISTS cluster_sequences (
   PRIMARY KEY (run_id, target, cluster_head)
 );
 
--- Pre-clustering unique AA sequences per barcode (for sticky sequence detection)
+# Pre-clustering unique AA sequences per barcode (for sticky sequence detection)
 CREATE TABLE IF NOT EXISTS raw_sequences (
   run_id        TEXT,
   target        TEXT,
@@ -1534,7 +1537,7 @@ CREATE TABLE IF NOT EXISTS raw_sequences (
   PRIMARY KEY (run_id, target, barcode, aa_sequence)
 );
 
--- Trimmed sticky sequence analysis results (separate from main sticky_sequences)
+# Trimmed sticky sequence analysis results (separate from main sticky_sequences)
 CREATE TABLE IF NOT EXISTS sticky_sequences_trimmed (
   id                  INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id              TEXT NOT NULL,
@@ -1553,7 +1556,7 @@ CREATE TABLE IF NOT EXISTS sticky_sequences_trimmed (
   UNIQUE(run_id, target, cluster_head, found_in_run_id, found_in_target, found_in_barcode, trim_start)
 );
 
--- Confirmed sticky sequences across runs
+# Confirmed sticky sequences across runs
 CREATE TABLE IF NOT EXISTS sticky_sequences (
   id                  INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id              TEXT NOT NULL,
@@ -1573,7 +1576,7 @@ CREATE TABLE IF NOT EXISTS sticky_sequences (
 CREATE INDEX IF NOT EXISTS idx_sticky_run_target ON sticky_sequences(run_id, target);
 CREATE INDEX IF NOT EXISTS idx_sticky_cluster_head ON sticky_sequences(cluster_head);
 
--- Sticky sequence results cache (persists across restarts)
+# Sticky sequence results cache (persists across restarts)
 CREATE TABLE IF NOT EXISTS sticky_cache (
   run_id            TEXT,
   target            TEXT,
@@ -1584,13 +1587,28 @@ CREATE TABLE IF NOT EXISTS sticky_cache (
   PRIMARY KEY (run_id, target, similarity_thresh, trim_start)
 );
 
--- Indexes for performance
+# Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_raw_sequences_aa ON raw_sequences(aa_sequence);
 CREATE INDEX IF NOT EXISTS idx_raw_sequences_run ON raw_sequences(run_id);
 CREATE INDEX IF NOT EXISTS idx_cluster_counts_run_target ON cluster_counts(run_id, target);
 CREATE INDEX IF NOT EXISTS idx_cluster_sequences_run_target ON cluster_sequences(run_id, target);
 
--- Most common nucleotide sequence per cluster representative
+# TG1 cross-target comparison results
+CREATE TABLE IF NOT EXISTS tg1_comparisons (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id              TEXT NOT NULL,
+  target              TEXT NOT NULL,
+  aa_sequence         TEXT NOT NULL,
+  found_in_run_id     TEXT NOT NULL,
+  found_in_sample_id  TEXT,
+  found_in_target     TEXT NOT NULL,
+  read_count          INTEGER,
+  flagged_at          TEXT,
+  UNIQUE(run_id, target, aa_sequence, found_in_run_id, found_in_target)
+);
+CREATE INDEX IF NOT EXISTS idx_tg1_comp_run_target ON tg1_comparisons(run_id, target);
+
+# Most common nucleotide sequence per cluster representative
 CREATE TABLE IF NOT EXISTS cluster_nt_sequences (
   run_id        TEXT,
   target        TEXT,
@@ -1658,11 +1676,20 @@ def _compute_target(args: dict) -> dict:
     from Bio.Seq import Seq
     import pandas as pd
 
-    run_id      = args["run_id"]
-    target      = args["target"]
-    control_dir = Path(args["control_dir"]) if args.get("control_dir") else None
-    onex_dir    = Path(args["onex_dir"])    if args.get("onex_dir")    else None
-    twox_dir    = Path(args["twox_dir"])    if args.get("twox_dir")    else None
+    run_id       = args["run_id"]
+    target       = args["target"]
+    # Support both old single-path and new multi-path formats
+    if "lib_dirs" in args:
+        control_dirs = [Path(p) for p in (args.get("control_dirs") or [])]
+        lib_dirs_raw = args.get("lib_dirs") or {}
+        # lib_dirs: {lib_name: [path, ...]}
+        lib_dirs = {k: [Path(p) for p in v] for k, v in lib_dirs_raw.items()}
+    else:
+        # Legacy format
+        control_dirs = [Path(args["control_dir"])] if args.get("control_dir") else []
+        lib_dirs = {}
+        if args.get("onex_dir"): lib_dirs["1xpanned"] = [Path(args["onex_dir"])]
+        if args.get("twox_dir"): lib_dirs["2xpanned"] = [Path(args["twox_dir"])]
     START       = args["START"]
     END         = args["END"]
     LENGTH      = args["LENGTH"]
@@ -1677,31 +1704,33 @@ def _compute_target(args: dict) -> dict:
         logs.append(f"  [{target}] {msg}")
 
     try:
-        control_files = find_fastq_files(control_dir) if control_dir else []
-        one_x_files   = find_fastq_files(onex_dir)    if onex_dir   else []
-        two_x_files   = find_fastq_files(twox_dir)    if twox_dir   else []
+        # Collect all FASTQ files per library
+        control_files = []
+        for d in control_dirs:
+            control_files.extend(find_fastq_files(d))
 
-        if not control_files and one_x_files and two_x_files:
-            log("No TG1 — using R1 as control, R2 as 1xpanned")
-            control_dir = onex_dir; control_files = one_x_files
-            onex_dir = twox_dir;    one_x_files   = two_x_files
-            twox_dir = None;        two_x_files   = []
-        elif not control_files and one_x_files:
-            log("No TG1 and only R1 — skipping")
-            return {"target": target, "skipped": True, "logs": logs}
+        lib_files = {}  # {lib_name: [files]}
+        for lib_name, dirs in lib_dirs.items():
+            files = []
+            for d in dirs:
+                files.extend(find_fastq_files(d))
+            if files:
+                lib_files[lib_name] = files
 
-        all_inputs = control_files + one_x_files + two_x_files
+        all_inputs = control_files + [f for files in lib_files.values() for f in files]
         if not all_inputs:
             log("No FASTQ files — skipping")
             return {"target": target, "skipped": True, "logs": logs}
 
         log("Counting reads...")
         total_reads_control  = count_fastq_records(control_files)
-        total_reads_1xpanned = count_fastq_records(one_x_files)
-        total_reads_2xpanned = count_fastq_records(two_x_files)
-        log(f"control={total_reads_control:,}  1x={total_reads_1xpanned:,}  2x={total_reads_2xpanned:,}")
+        total_reads_1xpanned = count_fastq_records(lib_files.get("1xpanned", []))
+        total_reads_2xpanned = count_fastq_records(lib_files.get("2xpanned", []))
+        for lib_name, files in lib_files.items():
+            log(f"{lib_name}={count_fastq_records(files):,}")
+        log(f"control={total_reads_control:,}")
 
-        with tempfile.TemporaryDirectory(prefix=f"nb_{target}_") as tmp:
+        with tempfile.TemporaryDirectory(prefix=f"nb_{target.replace(" ", "_")}_") as tmp:
             tmp_path       = Path(tmp)
             trimmed_fasta  = tmp_path / "trimmed_proteins.fasta"
             filtered_fasta = tmp_path / "filtered.fasta"
@@ -1711,19 +1740,20 @@ def _compute_target(args: dict) -> dict:
 
             log("Translating per-barcode sequences...")
             barcode_raw_seqs = {}
-            all_lib_paths = {}
-            if control_dir: all_lib_paths["control"]   = control_dir
-            if onex_dir:    all_lib_paths["1xpanned"]  = onex_dir
-            if twox_dir:    all_lib_paths["2xpanned"]  = twox_dir
+            # Build {lib_id: [files]} for all libraries
+            all_lib_files = {}
+            if control_files: all_lib_files["control"] = control_files
+            for lib_name, files in lib_files.items():
+                all_lib_files[lib_name] = files
 
             per_barcode_fastas = {}
-            read_id_to_barcode: Dict[str, str] = {}  # for optimized count matrix
-            read_id_to_nt: Dict[str, str] = {}  # nucleotide sequence per read_id
-            for lib_id, lib_path in all_lib_paths.items():
+            read_id_to_barcode: Dict[str, str] = {}
+            read_id_to_nt: Dict[str, str] = {}
+            for lib_id, fq_files in all_lib_files.items():
                 seq_counts = {}
                 bc_fasta = tmp_path / f"trimmed_{lib_id}.fasta"
                 with open(bc_fasta, "w") as bc_out:
-                    for fq in find_fastq_files(lib_path):
+                    for fq in fq_files:
                         opener = gzip.open(fq, "rt") if str(fq).endswith(".gz") else open(fq, "rt")
                         with opener as handle:
                             for record in SeqIO.parse(handle, "fastq"):
@@ -1866,9 +1896,9 @@ def _compute_target(args: dict) -> dict:
                 "target": target,
                 "skipped": False,
                 "logs": logs,
-                "control_dir": str(control_dir) if control_dir else None,
-                "onex_dir":    str(onex_dir)    if onex_dir    else None,
-                "twox_dir":    str(twox_dir)    if twox_dir    else None,
+                "control_path": ",".join(str(d) for d in control_dirs) if control_dirs else None,
+                "onex_path":    ",".join(str(p) for p in lib_dirs.get("1xpanned",[]) or []) or None,
+                "twox_path":    ",".join(str(p) for p in lib_dirs.get("2xpanned",[]) or []) or None,
                 "total_reads_control":  total_reads_control,
                 "total_reads_1xpanned": total_reads_1xpanned,
                 "total_reads_2xpanned": total_reads_2xpanned,
@@ -1891,9 +1921,8 @@ def ingest_target(
     conn: sqlite3.Connection,
     run_id: str,
     target: str,
-    control_dir: Path,
-    onex_dir: Optional[Path],
-    twox_dir: Optional[Path],
+    control_dirs: List[Path],
+    lib_dirs: Dict[str, List[Path]],
     START: str,
     END: str,
     LENGTH: int,
@@ -1911,9 +1940,8 @@ def ingest_target(
 
     result = _compute_target({
         "run_id": run_id, "target": target,
-        "control_dir": str(control_dir) if control_dir else None,
-        "onex_dir":    str(onex_dir)    if onex_dir    else None,
-        "twox_dir":    str(twox_dir)    if twox_dir    else None,
+        "control_dirs": [str(p) for p in control_dirs],
+        "lib_dirs": {k: [str(p) for p in v] for k, v in lib_dirs.items()},
         "START": START, "END": END, "LENGTH": LENGTH,
         "mm_min_seq_id": mm_min_seq_id, "mm_coverage": mm_coverage,
         "mm_cov_mode": mm_cov_mode, "use_linclust": use_linclust,
@@ -1942,7 +1970,7 @@ def _write_target_to_db(conn: sqlite3.Connection, result: dict):
                 kept_trimmed, kept_filtered, n_clusters)
                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (run_id, target,
-             result["control_dir"], result["onex_dir"], result["twox_dir"],
+             result.get("control_path"), result.get("onex_path"), result.get("twox_path"),
              result["total_reads_control"], result["total_reads_1xpanned"], result["total_reads_2xpanned"],
              result["kept5"], result["kept6"], result["n_clusters"])
         )
@@ -2040,21 +2068,38 @@ def ingest_run(
         if target in skip_targets:
             log(f"\nSkipping target: {target} (excluded by user)")
             continue
-        tg1_info = grp["tg1"]
+        tg1_list = grp["tg1"]  # list of bc_info dicts
         rounds   = grp["rounds"]
         target_overrides = (ext_overrides or {}).get(target, {})
-        control_dir = Path(tg1_info["folder_path"]) if tg1_info else (
-            target_overrides.get("tg1") or (ext_tg1_dir if ext_tg1_dir else None))
-        onex_dir = Path(rounds[1]["folder_path"]) if 1 in rounds else target_overrides.get("r1")
-        twox_dir = Path(rounds[2]["folder_path"]) if 2 in rounds else target_overrides.get("r2")
-        if not onex_dir and not twox_dir:
-            log(f"  [{target}] No panning rounds found — skipping")
+
+        # Build control dirs list (all TG1 barcodes)
+        control_dirs = [Path(bc["folder_path"]) for bc in tg1_list]
+        if not control_dirs and target_overrides.get("tg1"):
+            control_dirs = [target_overrides["tg1"]]
+        elif not control_dirs and ext_tg1_dir:
+            control_dirs = [ext_tg1_dir]
+
+        # Build panning round dirs — support multiple per round
+        # {lib_id: [path, ...]} e.g. {"1xpanned": [p1, p2], "2xpanned": [p1]}
+        lib_dirs = {}
+        for rnum, bc_list in sorted(rounds.items()):
+            lib_name = "1xpanned" if rnum == 1 else "2xpanned" if rnum == 2 else f"{rnum}xpanned"
+            lib_dirs[lib_name] = [Path(bc["folder_path"]) for bc in bc_list]
+        # Apply overrides
+        if target_overrides.get("r1") and "1xpanned" not in lib_dirs:
+            lib_dirs["1xpanned"] = [target_overrides["r1"]]
+        if target_overrides.get("r2") and "2xpanned" not in lib_dirs:
+            lib_dirs["2xpanned"] = [target_overrides["r2"]]
+
+        # Allow TG1-only runs — don't skip if no panning rounds
+        if not control_dirs and not lib_dirs:
+            log(f"  [{target}] No libraries found — skipping")
             continue
+
         target_args.append({
             "run_id": run_id, "target": target,
-            "control_dir": str(control_dir) if control_dir else None,
-            "onex_dir":    str(onex_dir)    if onex_dir    else None,
-            "twox_dir":    str(twox_dir)    if twox_dir    else None,
+            "control_dirs": [str(p) for p in control_dirs],
+            "lib_dirs": {k: [str(p) for p in v] for k, v in lib_dirs.items()},
             "START": START, "END": END, "LENGTH": LENGTH,
             "mm_min_seq_id": mm_min_seq_id, "mm_coverage": mm_coverage,
             "mm_cov_mode": mm_cov_mode, "use_linclust": use_linclust,
@@ -2153,7 +2198,7 @@ def find_sticky_sequences(
     query_trimmed_set = set(ch_to_trimmed.values())
 
     if trim_start == 0:
-        # ── Fast path: exact SQL match using index on aa_sequence ──────────────
+        # Fast path: exact SQL match using index on aa_sequence
         seq_ph = ",".join(["?"] * len(query_trimmed_set))
         query_trimmed_list = list(query_trimmed_set)
         raw = sql_df(conn,
@@ -2182,7 +2227,7 @@ def find_sticky_sequences(
             })
 
     else:
-        # ── Trimmed path: length pre-filter then trim in Python ────────────────
+        # Trimmed path: length pre-filter then trim in Python 
         # Query lengths are already trimmed, raw sequences are full length
         trimmed_lengths = [len(s) for s in query_trimmed_set if s]
         if not trimmed_lengths:
@@ -2288,16 +2333,8 @@ def page_sticky(conn: sqlite3.Connection):
         st.write("Most frequent sticky sequences")
         st.dataframe(summary, use_container_width=True)
 
-        display_cols = ["run_name", "target", "cluster_head", "aa_length",
-                        "found_in_run_name", "found_in_target", "found_in_barcode",
-                        "read_count", "similarity", "flagged_at"]
-        display_cols = [c for c in display_cols if c in df_s.columns]
-        st.write("Full sticky sequence records")
-        st.dataframe(df_s[display_cols], use_container_width=True)
-        st.download_button(f"Download CSV", df_s[display_cols].to_csv(index=False).encode(),
-                           download_filename, "text/csv", key=f"dl_{download_filename}")
 
-    # ── AA search
+    # AA search
     st.subheader("Search for amino acid sequence")
     search_aa = st.text_input("Paste an amino acid sequence to check if it appears in sticky sequences",
                                placeholder="MAGPAGAA...", key="sticky_aa_search")
@@ -2325,7 +2362,7 @@ def page_sticky(conn: sqlite3.Connection):
 
     st.divider()
 
-    # ── Filters
+    # Filters
     sim_filter = 1.0
     runs = sql_df(conn, "SELECT DISTINCT run_id FROM sticky_sequences")
     run_labels = {}
@@ -2336,7 +2373,7 @@ def page_sticky(conn: sqlite3.Connection):
         ["All"] + runs["run_id"].tolist(),
         format_func=lambda x: "All" if x == "All" else run_labels.get(x, x))
 
-    # ── Untrimmed section
+    # Untrimmed section
     if selected_run == "All":
         df_ut = sql_df(conn,
             "SELECT * FROM sticky_sequences WHERE similarity >= ? ORDER BY flagged_at DESC",
@@ -2348,7 +2385,7 @@ def page_sticky(conn: sqlite3.Connection):
 
     render_sticky_section(df_ut, conn, "Untrimmed sticky sequences", "sticky_untrimmed.csv")
 
-    # ── Trimmed section
+    # Trimmed section
     st.divider()
 
     trim_vals = sql_df(conn, "SELECT DISTINCT trim_start FROM sticky_sequences_trimmed ORDER BY trim_start")
@@ -2384,7 +2421,6 @@ def page_sticky(conn: sqlite3.Connection):
                 ch_run_map = {}
                 for _, row in df_tr[["cluster_head","run_id"]].drop_duplicates().iterrows():
                     ch_run_map[row["cluster_head"]] = row["run_id"]
-
 
 
                 # Fetch full AA sequences — search by cluster_head directly
@@ -2427,7 +2463,85 @@ def page_sticky(conn: sqlite3.Connection):
                 else:
                     st.info("Could not retrieve prefix data.")
 
-    # ── Global trimmed analysis at the bottom
+
+    st.divider()
+    st.subheader('TG1 cross-target summary')
+    st.caption('How unique is each TG1 library compared to all others in the database? Ranked from most shared to most unique.')
+
+    if st.button("Run TG1 comparison for all TG1s", type="primary", key="run_all_tg1"):
+        # Get unique TG1 barcodes — deduplicate by control_path
+        unique_tg1s = sql_df(conn, """
+            SELECT DISTINCT control_path, run_id, target
+            FROM target_run
+            WHERE control_path IS NOT NULL AND control_path != 'None'
+            GROUP BY control_path
+        """)
+        if unique_tg1s.empty:
+            st.warning("No TG1 barcodes found in the database.")
+        else:
+            progress = st.progress(0)
+            status = st.empty()
+            now = datetime.utcnow().isoformat()
+            conn.execute("DELETE FROM tg1_comparisons")
+            conn.execute("DELETE FROM sticky_cache WHERE trim_start=-1")
+            conn.commit()
+            for idx, row in unique_tg1s.iterrows():
+                rid, tgt, ctrl_path = row["run_id"], row["target"], row["control_path"]
+                status.text(f"Processing TG1: {ctrl_path.split('/')[-1].split(chr(92))[-1]}...")
+                # Load this TG1's sequences
+                this_tg1 = sql_df(conn,
+                    "SELECT aa_sequence, read_count FROM raw_sequences WHERE run_id=? AND target=? AND barcode='control'",
+                    (rid, tgt))
+                if not this_tg1.empty:
+                    this_seqs = set(this_tg1["aa_sequence"].tolist())
+                    # Get all OTHER unique TG1s' sequences
+                    other_tg1 = sql_df(conn, """
+                        SELECT rs.aa_sequence, rs.run_id, rs.target, rs.read_count, r.sample_id, tr.control_path as other_ctrl_path
+                        FROM raw_sequences rs
+                        JOIN run r ON rs.run_id = r.run_id
+                        JOIN target_run tr ON rs.run_id = tr.run_id AND rs.target = tr.target
+                        WHERE rs.barcode='control'
+                          AND tr.control_path != ?
+                          AND tr.control_path IS NOT NULL
+                        GROUP BY tr.control_path, rs.aa_sequence
+                    """, (ctrl_path,))
+                    if not other_tg1.empty:
+                        matches = other_tg1[other_tg1["aa_sequence"].isin(this_seqs)].copy()
+                        if not matches.empty:
+                            rows2 = [(rid, tgt, r2["aa_sequence"], r2["run_id"], r2["sample_id"], r2["target"], int(r2["read_count"]), now)
+                                    for _, r2 in matches.iterrows()]
+                            conn.executemany(
+                                "INSERT OR IGNORE INTO tg1_comparisons (run_id,target,aa_sequence,found_in_run_id,found_in_sample_id,found_in_target,read_count,flagged_at) VALUES (?,?,?,?,?,?,?,?)",
+                                rows2)
+                conn.execute("INSERT OR REPLACE INTO sticky_cache (run_id,target,similarity_thresh,trim_start,cached_at,result_json) VALUES (?,?,?,?,?,?)",
+                    (rid, tgt, 1.0, -1, now, "{}"))
+                conn.commit()
+                progress.progress((idx + 1) / len(unique_tg1s))
+            status.text("Done!")
+            st.rerun()
+
+    tg1_summary_df = sql_df(conn, """
+        SELECT
+            tr.control_path as tg1_path,
+            COUNT(DISTINCT tc.aa_sequence) as shared_sequences,
+            COUNT(DISTINCT tr2.control_path) as shared_with_n_tg1s
+        FROM tg1_comparisons tc
+        JOIN target_run tr ON tc.run_id = tr.run_id AND tc.target = tr.target
+        JOIN target_run tr2 ON tc.found_in_run_id = tr2.run_id AND tc.found_in_target = tr2.target
+        WHERE tr.control_path IS NOT NULL AND tr2.control_path IS NOT NULL
+          AND tr.control_path != tr2.control_path
+        GROUP BY tr.control_path
+        ORDER BY shared_sequences DESC
+    """)
+    if tg1_summary_df.empty:
+        st.info("No TG1 comparisons run yet. Click the button above to run for all TG1s.")
+    else:
+        tg1_summary_df["tg1_path"] = tg1_summary_df["tg1_path"].apply(
+            lambda p: p.split("/")[-1].split("\\")[-1] if p else "unknown")
+        tg1_summary_df.columns = ["TG1 barcode", "Shared sequences", "Shared with N other TG1s"]
+        st.dataframe(tg1_summary_df, use_container_width=True)
+
+    # Global trimmed analysis at the bottom
 def page_visualization(conn: sqlite3.Connection):
     st.header("Data Visualization")
     st.caption("Absolute and normalized counts across all runs and targets.")
@@ -2480,7 +2594,7 @@ def page_visualization(conn: sqlite3.Connection):
                               horizontal=True)
         normalize = norm_mode.startswith("Normalized")
 
-    # ── Total reads per barcode
+    # Total reads per barcode
     st.subheader("Total reads per barcode")
     if normalize:
         # Show each barcode as % of total reads in that run
@@ -2513,7 +2627,7 @@ def page_visualization(conn: sqlite3.Connection):
             )
             st.plotly_chart(fig_reads, use_container_width=True)
 
-            # ── Sequences passing filter
+            # Sequences passing filter
             st.subheader("Sequences passing filter")
             if normalize:
                 total = df["total_reads_control"] + df["total_reads_1xpanned"] + df["total_reads_2xpanned"]
@@ -2537,7 +2651,7 @@ def page_visualization(conn: sqlite3.Connection):
             )
             st.plotly_chart(fig_filtered, use_container_width=True)
 
-            # ── Number of clusters
+            # Number of clusters
             st.subheader("Number of clusters")
             fig_clusters = go.Figure(go.Bar(
                 x=df["label"], y=df["n_clusters"],
@@ -2551,7 +2665,7 @@ def page_visualization(conn: sqlite3.Connection):
             )
             st.plotly_chart(fig_clusters, use_container_width=True)
 
-            # ── Summary table (inside show_charts)
+            # Summary table (inside show_charts)
             with st.expander("Raw data table"):
                 st.dataframe(df[["sample_id", "target", "total_reads_control",
                                   "total_reads_1xpanned", "total_reads_2xpanned",
@@ -2563,12 +2677,8 @@ def page_visualization(conn: sqlite3.Connection):
                     "kept_filtered": "Filtered sequences",
                     "n_clusters": "Clusters"
                 }), use_container_width=True)
-                st.download_button("Download CSV",
-                    df[["sample_id","target","total_reads_control","total_reads_1xpanned",
-                        "total_reads_2xpanned","kept_filtered","n_clusters"]].to_csv(index=False).encode(),
-                    "visualization_data.csv", "text/csv")
 
-    # PCA Analysis 
+    # PCA Analysis (Matthias approach: AA composition per sequence)
     st.subheader("PCA — top 100 enriched sequences per target")
     st.caption("Each point is one nanobody sequence. Features are amino acid composition. Colored by target.")
 
@@ -2772,16 +2882,28 @@ def page_visualization(conn: sqlite3.Connection):
         if not ANARCI_AVAILABLE:
             st.error("ANARCI is not installed. Run: pip install anarci")
             return
-        with st.spinner("Extracting CDR sequences (IMGT numbering)..."):
+        with st.spinner("Extracting CDR sequences using ANARCI..."):
             seq_df_pca["cdr_sequence"] = seq_df_pca["aa_sequence"].apply(extract_cdrs_imgt)
             n_failed = seq_df_pca["cdr_sequence"].isna().sum()
+            # Debug: show a sample sequence and what ANARCI sees
+            sample_seq = seq_df_pca["aa_sequence"].iloc[0] if not seq_df_pca.empty else ""
+            import re as _re2
+            match2 = _re2.search(r"[QEKD]V[QL]", sample_seq)
+            clean_sample = sample_seq[match2.start():] if match2 else sample_seq
+            st.write(f"**Debug — sample sequence (first 50 AA):** `{sample_seq[:50]}`")
+            st.write(f"**After prefix strip (first 50 AA):** `{clean_sample[:50]}`")
+            st.write(f"**Prefix match found:** {match2.group() if match2 else 'None — regex failed'}")
+            import shutil as _shutil2
+            hmmscan_loc = _shutil2.which("hmmscan")
+            st.write(f"**hmmscan in PATH:** `{hmmscan_loc}`")
+            # Show first error if any
+            errors = seq_df_pca["cdr_sequence"].dropna().str.startswith("ERROR:") if not seq_df_pca["cdr_sequence"].dropna().empty else pd.Series([])
+            if errors.any():
+                first_err = seq_df_pca.loc[seq_df_pca["cdr_sequence"].str.startswith("ERROR:", na=False), "cdr_sequence"].iloc[0]
+                st.write(f"**ANARCI error:** `{first_err}`")
+            if n_failed > 0:
+                st.warning(f"{n_failed} sequences could not be annotated by ANARCI and will be excluded.")
             seq_df_pca = seq_df_pca[~seq_df_pca["cdr_sequence"].str.startswith("ERROR:", na=False)]
-            n_before_stop = len(seq_df_pca)
-            seq_df_pca = seq_df_pca[~seq_df_pca["cdr_sequence"].str.contains("*", regex=False, na=False)]
-            n_stop = n_before_stop - len(seq_df_pca)
-            n_excluded = n_failed + n_stop
-            if n_excluded > 0:
-                st.warning(f"{n_excluded} sequences could not be annotated and will be excluded.")
             seq_df_pca = seq_df_pca.dropna(subset=["cdr_sequence"])
             if len(seq_df_pca) < 3:
                 st.error("Not enough sequences could be annotated. Try using full sequence mode.")
@@ -2911,50 +3033,6 @@ def page_visualization(conn: sqlite3.Connection):
     st.plotly_chart(fig_pca, use_container_width=True)
     st.caption("Each dot is one nanobody sequence. Dashed ellipses show the 95% confidence region for each target. Sequences closer together have more similar amino acid compositions.")
 
-    # Show CDR table if CDRs only mode was used
-    if use_cdrs_only and "cdr_sequence" in seq_df_pca.columns:
-        with st.expander("CDR sequences", expanded=False):
-            import re as _re_cdr
-            def _extract_cdr_breakdown(seq):
-                try:
-                    match = _re_cdr.search(r'[QEKD]V[QL]', seq)
-                    clean = seq[match.start():] if match else seq
-                    results = _anarci([("s", clean)], scheme="imgt", output=False, ncpu=1)
-                    numbered, _, _ = results
-                    if not numbered[0]:
-                        return None, None, None
-                    positions = numbered[0][0][0]
-                    _CDR1 = set(range(27, 39))
-                    _CDR2 = set(range(56, 66))
-                    _CDR3 = set(range(105, 118))
-                    cdr1 = "".join(aa for (pos, _), aa in positions if pos in _CDR1 and aa != "-")
-                    cdr2 = "".join(aa for (pos, _), aa in positions if pos in _CDR2 and aa != "-")
-                    cdr3 = "".join(aa for (pos, _), aa in positions if pos in _CDR3 and aa != "-")
-                    return cdr1 or None, cdr2 or None, cdr3 or None
-                except Exception:
-                    return None, None, None
-
-            with st.spinner("Extracting CDR regions..."):
-                cdr_rows = []
-                for _, row in seq_df_pca.iterrows():
-                    cdr1, cdr2, cdr3 = _extract_cdr_breakdown(row["aa_sequence"])
-                    cdr_rows.append({
-                        "cluster_head": row["cluster_head"],
-                        "target": row["target"],
-                        "run": row["run"],
-                        "CDR1": cdr1,
-                        "CDR2": cdr2,
-                        "CDR3": cdr3,
-                    })
-            cdr_df = pd.DataFrame(cdr_rows)
-            st.dataframe(cdr_df, use_container_width=True)
-            st.download_button("Download CDR sequences CSV",
-                cdr_df.to_csv(index=False).encode(),
-                "cdr_sequences.csv", "text/csv", key="dl_cdr_seqs")
-
-
-
-
 
 def page_overview(conn: sqlite3.Connection):
     st.header("Overview")
@@ -3035,7 +3113,7 @@ def generate_enrichment_pdf(
     normal_style = styles["Normal"]
     small_style = ParagraphStyle("small", parent=styles["Normal"], fontSize=8)
 
-    # ── Title
+    # Title
     run_info = conn.execute("SELECT sample_id FROM run WHERE run_id=?", (run_id,)).fetchone()
     sample_id = run_info[0] if run_info else run_id[:8]
     story.append(Paragraph(f"Nanobody Enrichment Report", title_style))
@@ -3043,7 +3121,7 @@ def generate_enrichment_pdf(
     story.append(Paragraph(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", small_style))
     story.append(Spacer(1, 12))
 
-    # ── Ingest parameters
+    # Ingest parameters
     story.append(Paragraph("Ingest Parameters", heading_style))
     run_params = conn.execute(
         "SELECT start_anchor, end_anchor, min_aa_len, mm_min_seq_id, mm_coverage, use_linclust FROM run WHERE run_id=?",
@@ -3067,7 +3145,7 @@ def generate_enrichment_pdf(
         story.append(param_table)
     story.append(Spacer(1, 10))
 
-    # ── Analysis thresholds
+    # Analysis thresholds
     story.append(Paragraph("Analysis Thresholds", heading_style))
     thresh_data = [
         ["Baseline Threshold (control_norm)", "Enrichment Threshold (fold)"],
@@ -3086,7 +3164,7 @@ def generate_enrichment_pdf(
     story.append(thresh_table)
     story.append(Spacer(1, 10))
 
-    # ── Target QC stats
+    # Target QC stats
     story.append(Paragraph("Target Statistics", heading_style))
     tr = conn.execute(
         "SELECT total_reads_control, total_reads_1xpanned, total_reads_2xpanned, kept_filtered, n_clusters FROM target_run WHERE run_id=? AND target=?",
@@ -3109,7 +3187,7 @@ def generate_enrichment_pdf(
         story.append(qc_table)
     story.append(Spacer(1, 10))
 
-    # ── Sticky summary
+    # Sticky summary
     n_sticky = len(sticky_map)
     sticky_color = colors.HexColor("#fce8e8") if n_sticky > 0 else colors.HexColor("#d4edda")
     sticky_text = f"Sticky sequences: {n_sticky} flagged (appear in other runs at {100}% identity)"
@@ -3117,7 +3195,7 @@ def generate_enrichment_pdf(
                                                          backColor=sticky_color, borderPad=4)))
     story.append(Spacer(1, 10))
 
-    # ── Differential abundance plot
+    # Differential abundance plot
     story.append(Paragraph("Differential Abundance Plot", heading_style))
     if diff_fig is not None:
         try:
@@ -3130,7 +3208,7 @@ def generate_enrichment_pdf(
             story.append(Paragraph("(Plot could not be rendered)", small_style))
     story.append(Spacer(1, 10))
 
-    # ── Abundance distribution plot
+    # Abundance distribution plot
     story.append(Paragraph("Abundance Distribution by Library", heading_style))
     if abund_fig is not None:
         try:
@@ -3143,7 +3221,7 @@ def generate_enrichment_pdf(
             story.append(Paragraph("(Plot could not be rendered)", small_style))
     story.append(Spacer(1, 10))
 
-    # ── Count matrix table (top 30)
+    # Count matrix table (top 30)
     story.append(PageBreak())
     story.append(Paragraph(f"Top Clusters by Fold Enrichment", heading_style))
 
@@ -3178,7 +3256,7 @@ def generate_enrichment_pdf(
     story.append(cm_table)
     story.append(Spacer(1, 10))
 
-    # ── Top sequences
+    # Top sequences
     story.append(PageBreak())
     story.append(Paragraph("Top Cluster Amino Acid Sequences", heading_style))
     top_ids = cm_display["cluster_head"].astype(str).head(30).tolist()
@@ -3540,12 +3618,37 @@ def page_enrichment(conn: sqlite3.Connection):
     preferred = ["cluster_head","control_norm","1xpanned_norm","2xpanned_norm","fold_enrichment"]
     display_cols = [c for c in preferred if c in cm_display.columns]
 
-    cm_show = cm_display[display_cols].head(top_n).copy()
+    # Split into sequences with control reads vs control=0
+    if "control_norm" in cm_display.columns:
+        cm_with_ctrl = cm_display[pd.to_numeric(cm_display["control_norm"], errors="coerce").fillna(0) > 0].copy()
+        cm_zero_ctrl = cm_display[pd.to_numeric(cm_display["control_norm"], errors="coerce").fillna(0) == 0].copy()
+    else:
+        cm_with_ctrl = cm_display.copy()
+        cm_zero_ctrl = pd.DataFrame(columns=cm_display.columns)
+
+    cm_show = cm_with_ctrl[display_cols].head(top_n).copy()
     for _col in ["control_norm", "1xpanned_norm", "2xpanned_norm", "fold_enrichment"]:
         if _col in cm_show.columns:
             cm_show[_col] = pd.to_numeric(cm_show[_col], errors="coerce").round(2 if _col == "fold_enrichment" else 0)
             if _col != "fold_enrichment":
                 cm_show[_col] = cm_show[_col].astype("Int64")
+
+    # Build zero-control table with epsilon-based fold enrichment for ranking
+    EPSILON = 0.001
+    if not cm_zero_ctrl.empty:
+        compare_col = "2xpanned_norm" if "2xpanned_norm" in cm_zero_ctrl.columns else (
+            "1xpanned_norm" if "1xpanned_norm" in cm_zero_ctrl.columns else None)
+        if compare_col:
+            cm_zero_ctrl["fold_enrichment"] = pd.to_numeric(cm_zero_ctrl[compare_col], errors="coerce").fillna(0) / EPSILON
+            cm_zero_ctrl = cm_zero_ctrl.sort_values("fold_enrichment", ascending=False)
+        cm_zero_show = cm_zero_ctrl[display_cols].head(top_n).copy()
+        for _col in ["control_norm", "1xpanned_norm", "2xpanned_norm"]:
+            if _col in cm_zero_show.columns:
+                cm_zero_show[_col] = pd.to_numeric(cm_zero_show[_col], errors="coerce").round(0).astype("Int64")
+        if "fold_enrichment" in cm_zero_show.columns:
+            cm_zero_show["fold_enrichment"] = pd.to_numeric(cm_zero_show["fold_enrichment"], errors="coerce").round(1)
+    else:
+        cm_zero_show = pd.DataFrame(columns=display_cols)
 
     # Check if sticky detection has been run for this target
     sticky_run = conn.execute(
@@ -3569,10 +3672,21 @@ def page_enrichment(conn: sqlite3.Connection):
         st.dataframe(cm_show, use_container_width=True)
     else:
         st.dataframe(cm_show, use_container_width=True)
-    st.download_button("Download count matrix CSV",
-                       cm_display[display_cols].to_csv(index=False).encode(),
-                       f"{run_id[:8]}_{target}_count_matrix.csv", "text/csv")
 
+    # Separate table for sequences with 0 control reads
+    if not cm_zero_show.empty:
+        with st.expander(f"Sequences with 0 control reads ({len(cm_zero_ctrl):,} total)", expanded=False):
+            st.caption("These sequences had no reads in the control (TG1) library, so true fold enrichment is undefined. "
+                       f"Ranked here using a small epsilon ({EPSILON}) in place of 0 for the denominator — useful for seeing which "
+                       "of these are most abundant after panning, but treat the fold enrichment numbers as illustrative, not exact.")
+            def highlight_sticky_zero(row):
+                if row.get("cluster_head") in sticky_cluster_heads:
+                    return ["background-color: #fce8e8; color: #666666"] * len(row)
+                return [""] * len(row)
+            if sticky_cluster_heads:
+                st.dataframe(cm_zero_show.style.apply(highlight_sticky_zero, axis=1), use_container_width=True)
+            else:
+                st.dataframe(cm_zero_show, use_container_width=True)
 
 
     # Top sequences with sticky detection
@@ -3676,9 +3790,6 @@ def page_enrichment(conn: sqlite3.Connection):
                                       key=f"{run_id}_{target}_top{top_n}_{seq_label}")
                 with st.expander("FASTA text (manual copy fallback)"):
                     st.text_area("FASTA", value=fasta_text, height=220)
-
-
-
 
 
     st.divider()
@@ -3948,13 +4059,6 @@ def page_enrichment(conn: sqlite3.Connection):
                         diff_fig=diff_fig_for_pdf,
                         abund_fig=abund_fig_for_pdf,
                     )
-                    st.download_button(
-                        "Download PDF",
-                        pdf_bytes,
-                        f"{run_id[:8]}_{target}_enrichment_report.pdf",
-                        "application/pdf",
-                        key=f"pdf_dl_{run_id}_{target}"
-                    )
                 except Exception as e:
                     st.error(f"PDF generation failed: {e}")
 
@@ -3989,11 +4093,71 @@ def page_enrichment(conn: sqlite3.Connection):
                     st.dataframe(enriched.style.apply(highlight_sticky_enriched, axis=1), use_container_width=True)
                 else:
                     st.dataframe(enriched, use_container_width=True)
-                st.download_button("Download enriched candidates CSV",
-                                   enriched.to_csv(index=False).encode(),
-                                   f"{run_id[:8]}_{target}_enriched.csv", "text/csv")
             else:
                 st.info(f"No clusters meet thresholds (baseline ≥ {baseline_threshold}, fold ≥ {enrichment_threshold}×).")
+
+
+    st.divider()
+    with st.expander("TG1 cross-target analysis", expanded=False):
+        st.caption(f"Check whether sequences in this target's TG1 library appear in any other target's TG1 library across all runs.")
+
+        run_tg1_btn = st.button("Run TG1 comparison", type="primary", key=f"tg1_btn_{run_id}_{target}")
+
+        # Check if already run for this target
+        tg1_ever_run = conn.execute(
+            "SELECT COUNT(*) FROM tg1_comparisons WHERE run_id=? AND target=?",
+            (run_id, target)
+        ).fetchone()[0] > 0
+        # Also check if ran and found nothing (cache table)
+        tg1_ran_empty = conn.execute(
+            "SELECT COUNT(*) FROM sticky_cache WHERE run_id=? AND target=? AND trim_start=-1",
+            (run_id, target)
+        ).fetchone()[0] > 0
+        tg1_ever_run = tg1_ever_run or tg1_ran_empty
+
+        if run_tg1_btn:
+            with st.spinner("Comparing TG1 libraries..."):
+                this_tg1 = sql_df(conn,
+                    "SELECT aa_sequence, read_count FROM raw_sequences WHERE run_id=? AND target=? AND barcode='control'",
+                    (run_id, target))
+                if this_tg1.empty:
+                    st.warning("No TG1 (control) sequences found for this target.")
+                else:
+                    this_seqs = set(this_tg1["aa_sequence"].tolist())
+                    other_tg1 = sql_df(conn,
+                        "SELECT rs.aa_sequence, rs.run_id, rs.target, rs.read_count, r.sample_id FROM raw_sequences rs JOIN run r ON rs.run_id=r.run_id WHERE rs.barcode='control' AND NOT (rs.run_id=? AND rs.target=?)",
+                        (run_id, target))
+                    # Delete old results for this run/target
+                    conn.execute("DELETE FROM tg1_comparisons WHERE run_id=? AND target=?", (run_id, target))
+                    conn.execute("DELETE FROM sticky_cache WHERE run_id=? AND target=? AND trim_start=-1", (run_id, target))
+                    now = datetime.utcnow().isoformat()
+                    if not other_tg1.empty:
+                        matches = other_tg1[other_tg1["aa_sequence"].isin(this_seqs)].copy()
+                        if not matches.empty:
+                            rows = [(run_id, target, row["aa_sequence"], row["run_id"],
+                                     row["sample_id"], row["target"], int(row["read_count"]), now)
+                                    for _, row in matches.iterrows()]
+                            conn.executemany(
+                                "INSERT OR IGNORE INTO tg1_comparisons (run_id,target,aa_sequence,found_in_run_id,found_in_sample_id,found_in_target,read_count,flagged_at) VALUES (?,?,?,?,?,?,?,?)",
+                                rows)
+                    # Mark as run even if empty
+                    conn.execute(
+                        "INSERT OR REPLACE INTO sticky_cache (run_id,target,similarity_thresh,trim_start,cached_at,result_json) VALUES (?,?,?,?,?,?)",
+                        (run_id, target, 1.0, -1, now, "{}"))
+                    conn.commit()
+                    tg1_ever_run = True
+                    st.rerun()
+
+        # Load and display from DB
+        if tg1_ever_run:
+            tg1_df = sql_df(conn,
+                "SELECT found_in_sample_id as Run, found_in_target as Target, COUNT(DISTINCT aa_sequence) as shared_sequences, SUM(read_count) as total_reads FROM tg1_comparisons WHERE run_id=? AND target=? GROUP BY found_in_run_id, found_in_target ORDER BY shared_sequences DESC",
+                (run_id, target))
+            if tg1_df.empty:
+                st.success("✅ No sequences from this target's TG1 appear in any other target's TG1 library.")
+            else:
+                st.warning(f"⚠️ Shared TG1 sequences found in {len(tg1_df)} other target(s)")
+                st.dataframe(tg1_df, use_container_width=True)
 
 
 def page_ingest(conn: sqlite3.Connection, db_path: Path):
@@ -4014,25 +4178,89 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
                 st.success(f"Found {len(barcodes)} barcode folders → {len(groups)} target(s)")
                 preview_rows = []
                 for target, grp in sorted(groups.items()):
-                    tg1 = grp["tg1"]["label"] if grp["tg1"] else "— (no TG1)"
-                    r1  = grp["rounds"].get(1, {}).get("label", "—")
-                    r2  = grp["rounds"].get(2, {}).get("label", "—")
-                    preview_rows.append({"target": target, "TG1 (control)": tg1, "R1 (1xpanned)": r1, "R2 (2xpanned)": r2})
+                    tg1_labels = ", ".join(bc["label"] for bc in grp["tg1"]) if grp["tg1"] else "— (no TG1)"
+                    r1_labels  = ", ".join(bc["label"] for bc in grp["rounds"].get(1, [])) or "—"
+                    r2_labels  = ", ".join(bc["label"] for bc in grp["rounds"].get(2, [])) or "—"
+                    preview_rows.append({"target": target, "TG1 (control)": tg1_labels, "R1 (1xpanned)": r1_labels, "R2 (2xpanned)": r2_labels})
                 st.dataframe(pd.DataFrame(preview_rows), use_container_width=True)
 
-                # Target skip checkboxes
-                st.caption("Uncheck any targets you want to skip:")
-                skip_targets = []
-                cols = st.columns(min(4, len(groups)))
-                for idx, t in enumerate(sorted(groups.keys())):
-                    with cols[idx % len(cols)]:
-                        if not st.checkbox(t, value=True, key=f"ingest_target_{t}"):
-                            skip_targets.append(t)
-                if skip_targets:
-                    st.warning(f"Will skip: {', '.join(skip_targets)}")
-                else:
-                    st.session_state["skip_targets"] = []
+                st.caption("Edit target names or reassign barcodes below. Uncheck to skip.")
+                all_bc_labels = ["— (none)"] + [bc["label"] for bc in barcodes]
+                # R1/R2 options exclude the none placeholder
+                bc_options = [bc["label"] for bc in barcodes]
+
+                if "ingest_assignments" not in st.session_state or st.session_state.get("ingest_folder") != folder_path:
+                    assignments = {}
+                    for t2, grp2 in sorted(groups.items()):
+                        assignments[t2] = {
+                            "name": t2,
+                            "tg1": grp2["tg1"][0]["label"] if grp2["tg1"] else "— (none)",
+                            "r1":  [grp2["rounds"][1][0]["label"]] if 1 in grp2["rounds"] else [],
+                            "r2":  [grp2["rounds"][2][0]["label"]] if 2 in grp2["rounds"] else [],
+                            "include": True,
+                        }
+                    st.session_state["ingest_assignments"] = assignments
+                    st.session_state["ingest_folder"] = folder_path
+                assignments = st.session_state["ingest_assignments"]
+
+                # Header
+                hcols = st.columns([0.15, 1.5, 1.5, 1.5, 1.5])
+                for col, hdr in zip(hcols, ["", "Target name", "TG1 (control)", "R1 (1x panned)", "R2 (2x panned)"]):
+                    col.markdown(f"**{hdr}**")
+
+                for t2 in sorted(assignments.keys()):
+                    a = assignments[t2]
+                    if "extra_paths" not in a:
+                        a["extra_paths"] = {}  # label -> path, user-added external libs
+
+                    # Merge extra paths into available options
+                    extra_labels = list(a["extra_paths"].keys())
+                    all_tg1_opts = all_bc_labels + extra_labels
+                    all_r_opts   = bc_options + extra_labels
+
+                    rc = st.columns([0.15, 1.5, 1.5, 1.5, 1.5])
+                    with rc[0]:
+                        a["include"] = st.checkbox("", value=a["include"], key=f"inc_{t2}", label_visibility="collapsed")
+                    with rc[1]:
+                        a["name"] = st.text_input("", value=a["name"], key=f"tname_{t2}", label_visibility="collapsed")
+                    with rc[2]:
+                        tg1_idx = all_tg1_opts.index(a["tg1"]) if a["tg1"] in all_tg1_opts else 0
+                        a["tg1"] = st.selectbox("", all_tg1_opts, index=tg1_idx, key=f"tg1s_{t2}", label_visibility="collapsed")
+                    with rc[3]:
+                        a["r1"] = st.multiselect("", all_r_opts,
+                            default=[x for x in a["r1"] if x in all_r_opts], key=f"r1s_{t2}", label_visibility="collapsed")
+                    with rc[4]:
+                        a["r2"] = st.multiselect("", all_r_opts,
+                            default=[x for x in a["r2"] if x in all_r_opts], key=f"r2s_{t2}", label_visibility="collapsed")
+
+                    # Add external library expander
+                    with st.expander(f"Add external library to {a['name']}", expanded=False):
+                        ext_path_input = st.text_input("Folder path", key=f"ext_path_{t2}",
+                            placeholder="/path/to/barcode_folder")
+                        ext_lbl_input = st.text_input("Label", key=f"ext_lbl_{t2}",
+                            placeholder="e.g. barcode99_MyTarget_R1")
+                        if st.button("Add", key=f"ext_add_{t2}"):
+                            if ext_path_input.strip() and ext_lbl_input.strip():
+                                resolved = Path(ext_path_input.strip()).expanduser()
+                                if resolved.exists():
+                                    a["extra_paths"][ext_lbl_input.strip()] = str(resolved)
+                                    st.success(f"Added: {ext_lbl_input.strip()}")
+                                    st.rerun()
+                                else:
+                                    st.error("Path does not exist.")
+                        if a["extra_paths"]:
+                            st.caption("Added external libraries:")
+                            for lbl in list(a["extra_paths"].keys()):
+                                col_e1, col_e2 = st.columns([3, 1])
+                                col_e1.text(lbl)
+                                if col_e2.button("Remove", key=f"ext_rm_{t2}_{lbl}"):
+                                    del a["extra_paths"][lbl]
+                                    st.rerun()
+
+                skip_targets = [t2 for t2, a in assignments.items() if not a["include"]]
+                if skip_targets: st.warning(f"Will skip: {', '.join(skip_targets)}")
                 st.session_state["skip_targets"] = skip_targets
+                st.session_state["ingest_assignments"] = assignments
             else:
                 st.error("No barcode folders found.")
         else:
@@ -4058,98 +4286,7 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
         mm_coverage   = st.number_input("coverage",   0.0, 1.0, 0.90, 0.01, format="%.2f")
         mm_cov_mode   = st.number_input("cov_mode",   0, 5, 0, 1)
 
-    # ── External library overrides ──────────────────────────────────────────────
-    st.divider()
-    st.subheader("External library overrides (optional)")
-    st.caption(
-        "For any missing TG1, R1, or R2 in a target group, you can supply a barcode folder "
-        "from an already-ingested run or provide a direct folder path."
-    )
-
-    # Build a helper widget that returns a Path or None for a given slot
-    def library_selector(label: str, key_prefix: str) -> Optional[Path]:
-        source = st.radio(
-            f"{label} source",
-            ["None", "Already ingested run", "Folder path"],
-            horizontal=True,
-            key=f"{key_prefix}_source",
-        )
-        if source == "Already ingested run":
-            other_runs = sql_df(conn, "SELECT run_id, sample_id FROM run ORDER BY ingested_at DESC")
-            if other_runs.empty:
-                st.info("No runs ingested yet.")
-                return None
-            sel_run = st.selectbox(
-                "Source run",
-                other_runs["run_id"].tolist(),
-                format_func=lambda r: other_runs[other_runs["run_id"] == r]["sample_id"].iloc[0],
-                key=f"{key_prefix}_run",
-            )
-            # Get all barcode folders stored for that run
-            all_paths = sql_df(conn,
-                """SELECT DISTINCT control_path as path FROM target_run WHERE run_id=? AND control_path IS NOT NULL
-                   UNION
-                   SELECT DISTINCT onex_path   as path FROM target_run WHERE run_id=? AND onex_path IS NOT NULL
-                   UNION
-                   SELECT DISTINCT twox_path   as path FROM target_run WHERE run_id=? AND twox_path IS NOT NULL""",
-                (sel_run, sel_run, sel_run))
-            if all_paths.empty:
-                st.info("No barcode folders found for that run.")
-                return None
-            path_options = all_paths["path"].tolist()
-            path_labels  = [Path(p).name for p in path_options]
-            sel_idx = st.selectbox(
-                "Barcode folder",
-                range(len(path_labels)),
-                format_func=lambda i: path_labels[i],
-                key=f"{key_prefix}_bc",
-            )
-            chosen = Path(path_options[sel_idx])
-            st.caption(f"`{chosen}`")
-            return chosen
-        elif source == "Folder path":
-            raw = st.text_input(
-                f"{label} folder path",
-                placeholder="/Users/username/Downloads/run5/barcode06_P-aer_llama_TG1",
-                key=f"{key_prefix}_path",
-            )
-            if raw.strip():
-                resolved = Path(raw.strip()).expanduser()
-                if resolved.exists():
-                    st.success(f"Found: `{resolved}`")
-                    return resolved
-                else:
-                    st.error("Path does not exist.")
-        return None
-
-    # Show override widgets only for targets that are missing one or more slots
-    ext_overrides: Dict[str, Dict[str, Optional[Path]]] = {}  # {target: {slot: path}}
-
-    if folder_path.strip():
-        p_check = Path(folder_path.strip()).expanduser()
-        if p_check.exists():
-            barcodes_check = discover_barcodes(p_check)
-            if barcodes_check:
-                groups_check = group_barcodes_by_target(barcodes_check)
-                missing_targets = {
-                    t: g for t, g in groups_check.items()
-                    if g["tg1"] is None or 1 not in g["rounds"] or 2 not in g["rounds"]
-                }
-                if missing_targets:
-                    for target, grp in sorted(missing_targets.items()):
-                        with st.expander(f"⚠️  {target} — missing libraries"):
-                            ext_overrides[target] = {}
-                            if grp["tg1"] is None:
-                                st.markdown("**TG1 (control) — not found in run folder**")
-                                ext_overrides[target]["tg1"] = library_selector("TG1", f"{target}_tg1")
-                            if 1 not in grp["rounds"]:
-                                st.markdown("**R1 (1xpanned) — not found in run folder**")
-                                ext_overrides[target]["r1"] = library_selector("R1", f"{target}_r1")
-                            if 2 not in grp["rounds"]:
-                                st.markdown("**R2 (2xpanned) — not found in run folder**")
-                                ext_overrides[target]["r2"] = library_selector("R2", f"{target}_r2")
-                else:
-                    st.success("All targets have complete TG1 / R1 / R2 — no overrides needed.")
+    ext_overrides: Dict[str, Dict[str, Optional[Path]]] = {}
 
     # Final preview table — reflects skips and overrides
     if folder_path.strip() and 'groups' in dir():
@@ -4167,12 +4304,12 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
                 for tgt, grp in sorted(_groups.items()):
                     if tgt in _skip:
                         continue
-                    tg1_bc = grp["tg1"]
+                    tg1_bcs_fp = grp["tg1"]
                     rounds = grp["rounds"]
                     _ov = ext_overrides.get(tgt, {}) if 'ext_overrides' in dir() else {}
 
                     tg1_path = (
-                        tg1_bc["folder_path"] if tg1_bc else
+                        tg1_bcs_fp[0]["folder_path"] if tg1_bcs_fp else
                         str(_ov.get("tg1") or "") or
                         (str(ext_tg1_path) if 'ext_tg1_path' in dir() and ext_tg1_path else "— (no TG1)")
                     )
@@ -4209,6 +4346,28 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
         if not p.exists():
             st.error("Path does not exist.")
             return
+        # Apply editable assignments to ext_overrides
+        assignments = st.session_state.get("ingest_assignments", {})
+        all_bcs_start = discover_barcodes(p)
+        all_bc_by_label_start = {bc["label"]: bc for bc in all_bcs_start}
+        for orig_target, a in assignments.items():
+            if not a["include"]: continue
+            if orig_target not in ext_overrides: ext_overrides[orig_target] = {}
+            tg1_bc = all_bc_by_label_start.get(a["tg1"])
+            extra_paths = a.get("extra_paths", {})
+            def _resolve(lbl):
+                bc = all_bc_by_label_start.get(lbl)
+                if bc: return Path(bc["folder_path"])
+                if lbl in extra_paths: return Path(extra_paths[lbl])
+                return None
+            if tg1_bc: ext_overrides[orig_target]["tg1_path"] = Path(tg1_bc["folder_path"])
+            r1_list = a["r1"] if isinstance(a["r1"], list) else ([a["r1"]] if a["r1"] else [])
+            r2_list = a["r2"] if isinstance(a["r2"], list) else ([a["r2"]] if a["r2"] else [])
+            r1_paths = [_resolve(lbl) for lbl in r1_list if _resolve(lbl)]
+            r2_paths = [_resolve(lbl) for lbl in r2_list if _resolve(lbl)]
+            if r1_paths: ext_overrides[orig_target]["r1_paths"] = r1_paths
+            if r2_paths: ext_overrides[orig_target]["r2_paths"] = r2_paths
+            ext_overrides[orig_target]["rename"] = a["name"].strip() or orig_target
         log_area = st.empty()
         msgs = []
         def log(m):
