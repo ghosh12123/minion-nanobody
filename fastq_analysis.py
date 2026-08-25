@@ -1526,7 +1526,7 @@ CREATE TABLE IF NOT EXISTS cluster_sequences (
   PRIMARY KEY (run_id, target, cluster_head)
 );
 
-# Pre-clustering unique AA sequences per barcode (for sticky sequence detection)
+-- Pre-clustering unique AA sequences per barcode (for sticky sequence detection)
 CREATE TABLE IF NOT EXISTS raw_sequences (
   run_id        TEXT,
   target        TEXT,
@@ -1537,7 +1537,7 @@ CREATE TABLE IF NOT EXISTS raw_sequences (
   PRIMARY KEY (run_id, target, barcode, aa_sequence)
 );
 
-# Trimmed sticky sequence analysis results (separate from main sticky_sequences)
+-- Trimmed sticky sequence analysis results (separate from main sticky_sequences)
 CREATE TABLE IF NOT EXISTS sticky_sequences_trimmed (
   id                  INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id              TEXT NOT NULL,
@@ -1556,7 +1556,7 @@ CREATE TABLE IF NOT EXISTS sticky_sequences_trimmed (
   UNIQUE(run_id, target, cluster_head, found_in_run_id, found_in_target, found_in_barcode, trim_start)
 );
 
-# Confirmed sticky sequences across runs
+-- Confirmed sticky sequences across runs
 CREATE TABLE IF NOT EXISTS sticky_sequences (
   id                  INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id              TEXT NOT NULL,
@@ -1576,7 +1576,7 @@ CREATE TABLE IF NOT EXISTS sticky_sequences (
 CREATE INDEX IF NOT EXISTS idx_sticky_run_target ON sticky_sequences(run_id, target);
 CREATE INDEX IF NOT EXISTS idx_sticky_cluster_head ON sticky_sequences(cluster_head);
 
-# Sticky sequence results cache (persists across restarts)
+-- Sticky sequence results cache (persists across restarts)
 CREATE TABLE IF NOT EXISTS sticky_cache (
   run_id            TEXT,
   target            TEXT,
@@ -1587,13 +1587,13 @@ CREATE TABLE IF NOT EXISTS sticky_cache (
   PRIMARY KEY (run_id, target, similarity_thresh, trim_start)
 );
 
-# Indexes for performance
+-- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_raw_sequences_aa ON raw_sequences(aa_sequence);
 CREATE INDEX IF NOT EXISTS idx_raw_sequences_run ON raw_sequences(run_id);
 CREATE INDEX IF NOT EXISTS idx_cluster_counts_run_target ON cluster_counts(run_id, target);
 CREATE INDEX IF NOT EXISTS idx_cluster_sequences_run_target ON cluster_sequences(run_id, target);
 
-# TG1 cross-target comparison results
+-- TG1 cross-target comparison results
 CREATE TABLE IF NOT EXISTS tg1_comparisons (
   id                  INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id              TEXT NOT NULL,
@@ -1608,7 +1608,7 @@ CREATE TABLE IF NOT EXISTS tg1_comparisons (
 );
 CREATE INDEX IF NOT EXISTS idx_tg1_comp_run_target ON tg1_comparisons(run_id, target);
 
-# Most common nucleotide sequence per cluster representative
+-- Most common nucleotide sequence per cluster representative
 CREATE TABLE IF NOT EXISTS cluster_nt_sequences (
   run_id        TEXT,
   target        TEXT,
