@@ -2678,7 +2678,7 @@ def page_visualization(conn: sqlite3.Connection):
                     "n_clusters": "Clusters"
                 }), use_container_width=True)
 
-    # PCA Analysis (Matthias approach: AA composition per sequence)
+    # PCA Analysis
     st.subheader("PCA — top 100 enriched sequences per target")
     st.caption("Each point is one nanobody sequence. Features are amino acid composition. Colored by target.")
 
