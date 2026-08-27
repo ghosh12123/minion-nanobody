@@ -1813,30 +1813,42 @@ def _compute_target(args: dict) -> dict:
                 cluster_tsv=cluster_tsv,
                 drop_unclustered=drop_unclustered,
             )
-            for col in ["control", "1xpanned", "2xpanned"]:
+            # Ensure all lib columns exist
+            for col in list(lib_files.keys()) + ["control"]:
                 if col not in count_matrix.columns:
                     count_matrix[col] = 0
 
             log("Normalizing...")
             count_matrix["control_norm"] = count_matrix["control"].astype(float).round(0).astype("Int64")
-            if total_reads_control > 0 and total_reads_1xpanned > 0:
-                count_matrix["1xpanned_norm"] = (
-                    count_matrix["1xpanned"].astype(float)
-                    * (float(total_reads_control) / float(total_reads_1xpanned))
-                ).round(0).astype("Int64")
-            else:
-                count_matrix["1xpanned_norm"] = pd.Series([pd.NA]*len(count_matrix), dtype="Int64")
-            if total_reads_control > 0 and total_reads_2xpanned > 0:
-                count_matrix["2xpanned_norm"] = (
-                    count_matrix["2xpanned"].astype(float)
-                    * (float(total_reads_control) / float(total_reads_2xpanned))
-                ).round(0).astype("Int64")
-            else:
-                count_matrix["2xpanned_norm"] = pd.Series([pd.NA]*len(count_matrix), dtype="Int64")
+            total_reads_by_lib = {
+                "control": total_reads_control,
+                "1xpanned": total_reads_1xpanned,
+                "2xpanned": total_reads_2xpanned,
+            }
+            for lib_name, fq_files in lib_files.items():
+                if lib_name not in total_reads_by_lib:
+                    total_reads_by_lib[lib_name] = count_fastq_records(fq_files)
 
-            count_matrix = count_matrix.sort_values(
-                by="2xpanned_norm", ascending=False, kind="mergesort", na_position="last"
-            ).reset_index(drop=True)
+            all_panning_libs = sorted(
+                [k for k in count_matrix.columns if k.endswith("xpanned")],
+                key=lambda x: int("".join(filter(str.isdigit, x.replace("xpanned","")))) if any(c.isdigit() for c in x) else 0
+            )
+            for lib_name in all_panning_libs:
+                norm_col = f"{lib_name}_norm"
+                total_lib = total_reads_by_lib.get(lib_name, 0)
+                if total_reads_control > 0 and total_lib > 0:
+                    count_matrix[norm_col] = (
+                        count_matrix[lib_name].astype(float)
+                        * (float(total_reads_control) / float(total_lib))
+                    ).round(0).astype("Int64")
+                else:
+                    count_matrix[norm_col] = pd.Series([pd.NA]*len(count_matrix), dtype="Int64")
+
+            last_norm = f"{all_panning_libs[-1]}_norm" if all_panning_libs else "2xpanned_norm"
+            if last_norm in count_matrix.columns:
+                count_matrix = count_matrix.sort_values(
+                    by=last_norm, ascending=False, kind="mergesort", na_position="last"
+                ).reset_index(drop=True)
 
             n_clusters = len(count_matrix)
             log(f"{n_clusters:,} clusters")
@@ -1882,7 +1894,9 @@ def _compute_target(args: dict) -> dict:
             count_rows = []
             for _, row in count_matrix.iterrows():
                 ch = str(row["cluster_head"])
-                for lib, norm_col in [("control","control_norm"),("1xpanned","1xpanned_norm"),("2xpanned","2xpanned_norm")]:
+                all_libs = ["control"] + all_panning_libs
+                for lib in all_libs:
+                    norm_col = f"{lib}_norm" if lib != "control" else "control_norm"
                     raw = int(row.get(lib, 0) or 0)
                     nv  = row.get(norm_col, raw)
                     norm = float(nv) if nv is not pd.NA and nv is not None else float(raw)
@@ -2085,11 +2099,15 @@ def ingest_run(
         for rnum, bc_list in sorted(rounds.items()):
             lib_name = "1xpanned" if rnum == 1 else "2xpanned" if rnum == 2 else f"{rnum}xpanned"
             lib_dirs[lib_name] = [Path(bc["folder_path"]) for bc in bc_list]
-        # Apply overrides
-        if target_overrides.get("r1") and "1xpanned" not in lib_dirs:
-            lib_dirs["1xpanned"] = [target_overrides["r1"]]
-        if target_overrides.get("r2") and "2xpanned" not in lib_dirs:
-            lib_dirs["2xpanned"] = [target_overrides["r2"]]
+        # Apply overrides — handles arbitrary rounds (1xpanned, 2xpanned, 3xpanned, etc.)
+        for key, val in target_overrides.items():
+            if key.endswith("_paths") and key != "tg1_path":
+                lib_name = key[:-6]  # strip "_paths"
+                lib_dirs[lib_name] = val if isinstance(val, list) else [val]
+            elif key in ("r1", "r2"):  # legacy single-path overrides
+                lname = "1xpanned" if key == "r1" else "2xpanned"
+                if lname not in lib_dirs:
+                    lib_dirs[lname] = [target_overrides[key]]
 
         # Allow TG1-only runs — don't skip if no panning rounds
         if not control_dirs and not lib_dirs:
@@ -2471,9 +2489,9 @@ def page_sticky(conn: sqlite3.Connection):
     if st.button("Run TG1 comparison for all TG1s", type="primary", key="run_all_tg1"):
         # Get unique TG1 barcodes — deduplicate by control_path
         unique_tg1s = sql_df(conn, """
-            SELECT DISTINCT control_path, run_id, target
+            SELECT control_path, run_id, target
             FROM target_run
-            WHERE control_path IS NOT NULL AND control_path != 'None'
+            WHERE control_path IS NOT NULL AND control_path != 'None' AND control_path != ''
             GROUP BY control_path
         """)
         if unique_tg1s.empty:
@@ -3370,25 +3388,26 @@ def page_enrichment(conn: sqlite3.Connection):
             count_matrix_for_plots[lib] = pd.to_numeric(count_matrix_for_plots[norm_col], errors="coerce")
 
     # Determine condition libs early (needed for PDF export and plots)
-    condition_libs = [c for c in ["1xpanned", "2xpanned"] if c in count_matrix_for_plots.columns and count_matrix_for_plots[c].sum() > 0]
+    condition_libs = [c for c in count_matrix_for_plots.columns if c.endswith("xpanned") and count_matrix_for_plots[c].sum() > 0]
 
-    # Count matrix preview — add fold_enrichment column
+    # Count matrix preview — add fold_enrichment column using highest available round
     cm_display = count_matrix.copy()
-    if "2xpanned_norm" in cm_display.columns and "control_norm" in cm_display.columns:
+    # Find the highest round norm column available
+    round_norm_cols = sorted(
+        [c for c in cm_display.columns if c.endswith("_norm") and c != "control_norm"],
+        key=lambda c: int(''.join(filter(str.isdigit, c.replace("xpanned_norm","").replace("panned_norm","")))) if any(ch.isdigit() for ch in c) else 0,
+        reverse=True
+    )
+    last_round_col = round_norm_cols[0] if round_norm_cols else None
+
+    if last_round_col and "control_norm" in cm_display.columns:
         cm_display["fold_enrichment"] = cm_display.apply(
-            lambda r: round(float(r["2xpanned_norm"]) / float(r["control_norm"]), 2)
+            lambda r: round(float(r[last_round_col]) / float(r["control_norm"]), 2)
             if (r["control_norm"] is not None and float(r["control_norm"]) > 0) else None,
             axis=1
         )
-        cm_display = cm_display.sort_values("fold_enrichment", ascending=False, na_position="last")
-    elif "1xpanned_norm" in cm_display.columns and "control_norm" in cm_display.columns:
-        cm_display["fold_enrichment"] = cm_display.apply(
-            lambda r: round(float(r["1xpanned_norm"]) / float(r["control_norm"]), 2)
-            if (r["control_norm"] is not None and float(r["control_norm"]) > 0) else None,
-            axis=1
-        )
-        cm_display["_r1"] = pd.to_numeric(cm_display.get("1xpanned_norm", 0), errors="coerce").fillna(0)
-        cm_display = cm_display.sort_values(["fold_enrichment", "_r1"], ascending=[False, False], na_position="last").drop(columns=["_r1"])
+        cm_display["_last"] = pd.to_numeric(cm_display[last_round_col], errors="coerce").fillna(0)
+        cm_display = cm_display.sort_values(["fold_enrichment", "_last"], ascending=[False, False], na_position="last").drop(columns=["_last"])
 
     # Compute sticky sequences early so we can highlight both tables
     sticky_mode = "percent"
@@ -3615,7 +3634,8 @@ def page_enrichment(conn: sqlite3.Connection):
             return ["background-color: #fce8e8; color: #666666"] * len(row)
         return [""] * len(row)
 
-    preferred = ["cluster_head","control_norm","1xpanned_norm","2xpanned_norm","fold_enrichment"]
+    all_norm_cols = sorted([c for c in cm_display.columns if c.endswith("_norm")], key=lambda c: (c != "control_norm", c))
+    preferred = ["cluster_head"] + all_norm_cols + ["fold_enrichment"]
     display_cols = [c for c in preferred if c in cm_display.columns]
 
     # Split into sequences with control reads vs control=0
@@ -3627,28 +3647,26 @@ def page_enrichment(conn: sqlite3.Connection):
         cm_zero_ctrl = pd.DataFrame(columns=cm_display.columns)
 
     cm_show = cm_with_ctrl[display_cols].head(top_n).copy()
-    for _col in ["control_norm", "1xpanned_norm", "2xpanned_norm", "fold_enrichment"]:
-        if _col in cm_show.columns:
-            cm_show[_col] = pd.to_numeric(cm_show[_col], errors="coerce").round(2 if _col == "fold_enrichment" else 0)
-            if _col != "fold_enrichment":
-                cm_show[_col] = cm_show[_col].astype("Int64")
+    for _col in [c for c in cm_show.columns if c.endswith("_norm") or c == "fold_enrichment"]:
+        cm_show[_col] = pd.to_numeric(cm_show[_col], errors="coerce").round(2 if _col == "fold_enrichment" else 0)
+        if _col != "fold_enrichment":
+            cm_show[_col] = cm_show[_col].astype("Int64")
 
-    # Build zero-control table with epsilon-based fold enrichment for ranking
-    EPSILON = 0.001
-    if not cm_zero_ctrl.empty:
-        compare_col = "2xpanned_norm" if "2xpanned_norm" in cm_zero_ctrl.columns else (
-            "1xpanned_norm" if "1xpanned_norm" in cm_zero_ctrl.columns else None)
-        if compare_col:
-            cm_zero_ctrl["fold_enrichment"] = pd.to_numeric(cm_zero_ctrl[compare_col], errors="coerce").fillna(0) / EPSILON
-            cm_zero_ctrl = cm_zero_ctrl.sort_values("fold_enrichment", ascending=False)
+    # Build zero-control table using 1 as denominator
+    # last_round_col is the norm column e.g. "2xpanned_norm"
+    zero_num_col = last_round_col  # already the norm column
+    if not cm_zero_ctrl.empty and zero_num_col and zero_num_col in cm_zero_ctrl.columns:
+        cm_zero_ctrl["fold_enrichment"] = pd.to_numeric(cm_zero_ctrl[zero_num_col], errors="coerce").fillna(0) / 1.0
+        cm_zero_ctrl = cm_zero_ctrl.sort_values("fold_enrichment", ascending=False)
         cm_zero_show = cm_zero_ctrl[display_cols].head(top_n).copy()
-        for _col in ["control_norm", "1xpanned_norm", "2xpanned_norm"]:
-            if _col in cm_zero_show.columns:
-                cm_zero_show[_col] = pd.to_numeric(cm_zero_show[_col], errors="coerce").round(0).astype("Int64")
-        if "fold_enrichment" in cm_zero_show.columns:
-            cm_zero_show["fold_enrichment"] = pd.to_numeric(cm_zero_show["fold_enrichment"], errors="coerce").round(1)
+        for _col in [c for c in cm_zero_show.columns if c.endswith("_norm") or c == "fold_enrichment"]:
+            cm_zero_show[_col] = pd.to_numeric(cm_zero_show[_col], errors="coerce").round(2 if _col == "fold_enrichment" else 0)
+            if _col != "fold_enrichment":
+                cm_zero_show[_col] = cm_zero_show[_col].astype("Int64")
     else:
         cm_zero_show = pd.DataFrame(columns=display_cols)
+
+
 
     # Check if sticky detection has been run for this target
     sticky_run = conn.execute(
@@ -3676,9 +3694,9 @@ def page_enrichment(conn: sqlite3.Connection):
     # Separate table for sequences with 0 control reads
     if not cm_zero_show.empty:
         with st.expander(f"Sequences with 0 control reads ({len(cm_zero_ctrl):,} total)", expanded=False):
-            st.caption("These sequences had no reads in the control (TG1) library, so true fold enrichment is undefined. "
-                       f"Ranked here using a small epsilon ({EPSILON}) in place of 0 for the denominator — useful for seeing which "
-                       "of these are most abundant after panning, but treat the fold enrichment numbers as illustrative, not exact.")
+            st.caption("These sequences had no reads in the control (TG1) library. "
+                       "Fold enrichment here is calculated using 1 in place of 0 for the control — "
+                       "treat these numbers as approximate.")
             def highlight_sticky_zero(row):
                 if row.get("cluster_head") in sticky_cluster_heads:
                     return ["background-color: #fce8e8; color: #666666"] * len(row)
@@ -4098,66 +4116,41 @@ def page_enrichment(conn: sqlite3.Connection):
 
 
     st.divider()
-    with st.expander("TG1 cross-target analysis", expanded=False):
-        st.caption(f"Check whether sequences in this target's TG1 library appear in any other target's TG1 library across all runs.")
+    with st.expander("Unique TG1 sequences", expanded=False):
+        st.caption("Top 100 sequences by abundance in this target's TG1 library that do not appear in any other TG1 library in the database.")
 
-        run_tg1_btn = st.button("Run TG1 comparison", type="primary", key=f"tg1_btn_{run_id}_{target}")
-
-        # Check if already run for this target
-        tg1_ever_run = conn.execute(
-            "SELECT COUNT(*) FROM tg1_comparisons WHERE run_id=? AND target=?",
-            (run_id, target)
-        ).fetchone()[0] > 0
-        # Also check if ran and found nothing (cache table)
-        tg1_ran_empty = conn.execute(
-            "SELECT COUNT(*) FROM sticky_cache WHERE run_id=? AND target=? AND trim_start=-1",
-            (run_id, target)
-        ).fetchone()[0] > 0
-        tg1_ever_run = tg1_ever_run or tg1_ran_empty
-
-        if run_tg1_btn:
-            with st.spinner("Comparing TG1 libraries..."):
+        # Check if TG1 comparison has been run globally
+        tg1_ran = conn.execute("SELECT COUNT(*) FROM sticky_cache WHERE trim_start=-1").fetchone()[0] > 0
+        if not tg1_ran:
+            st.info("Run the TG1 comparison first on the Sticky Sequences page.")
+        else:
+            # Get this target's control_path
+            ctrl_path_row = conn.execute(
+                "SELECT control_path FROM target_run WHERE run_id=? AND target=?",
+                (run_id, target)).fetchone()
+            if not ctrl_path_row or not ctrl_path_row[0]:
+                st.warning("No TG1 barcode path found for this target.")
+            else:
+                ctrl_path = ctrl_path_row[0]
+                # Get sequences from this TG1 that appear in tg1_comparisons (shared with others)
+                shared_seqs = sql_df(conn,
+                    "SELECT DISTINCT aa_sequence FROM tg1_comparisons WHERE run_id=? AND target=?",
+                    (run_id, target))
+                shared_set = set(shared_seqs["aa_sequence"].tolist()) if not shared_seqs.empty else set()
+                # Get top 100 TG1 sequences by read count, exclude shared ones
                 this_tg1 = sql_df(conn,
-                    "SELECT aa_sequence, read_count FROM raw_sequences WHERE run_id=? AND target=? AND barcode='control'",
+                    "SELECT aa_sequence, SUM(read_count) as total_reads FROM raw_sequences WHERE run_id=? AND target=? AND barcode='control' GROUP BY aa_sequence ORDER BY total_reads DESC",
                     (run_id, target))
                 if this_tg1.empty:
-                    st.warning("No TG1 (control) sequences found for this target.")
+                    st.info("No TG1 sequences found for this target.")
                 else:
-                    this_seqs = set(this_tg1["aa_sequence"].tolist())
-                    other_tg1 = sql_df(conn,
-                        "SELECT rs.aa_sequence, rs.run_id, rs.target, rs.read_count, r.sample_id FROM raw_sequences rs JOIN run r ON rs.run_id=r.run_id WHERE rs.barcode='control' AND NOT (rs.run_id=? AND rs.target=?)",
-                        (run_id, target))
-                    # Delete old results for this run/target
-                    conn.execute("DELETE FROM tg1_comparisons WHERE run_id=? AND target=?", (run_id, target))
-                    conn.execute("DELETE FROM sticky_cache WHERE run_id=? AND target=? AND trim_start=-1", (run_id, target))
-                    now = datetime.utcnow().isoformat()
-                    if not other_tg1.empty:
-                        matches = other_tg1[other_tg1["aa_sequence"].isin(this_seqs)].copy()
-                        if not matches.empty:
-                            rows = [(run_id, target, row["aa_sequence"], row["run_id"],
-                                     row["sample_id"], row["target"], int(row["read_count"]), now)
-                                    for _, row in matches.iterrows()]
-                            conn.executemany(
-                                "INSERT OR IGNORE INTO tg1_comparisons (run_id,target,aa_sequence,found_in_run_id,found_in_sample_id,found_in_target,read_count,flagged_at) VALUES (?,?,?,?,?,?,?,?)",
-                                rows)
-                    # Mark as run even if empty
-                    conn.execute(
-                        "INSERT OR REPLACE INTO sticky_cache (run_id,target,similarity_thresh,trim_start,cached_at,result_json) VALUES (?,?,?,?,?,?)",
-                        (run_id, target, 1.0, -1, now, "{}"))
-                    conn.commit()
-                    tg1_ever_run = True
-                    st.rerun()
-
-        # Load and display from DB
-        if tg1_ever_run:
-            tg1_df = sql_df(conn,
-                "SELECT found_in_sample_id as Run, found_in_target as Target, COUNT(DISTINCT aa_sequence) as shared_sequences, SUM(read_count) as total_reads FROM tg1_comparisons WHERE run_id=? AND target=? GROUP BY found_in_run_id, found_in_target ORDER BY shared_sequences DESC",
-                (run_id, target))
-            if tg1_df.empty:
-                st.success("✅ No sequences from this target's TG1 appear in any other target's TG1 library.")
-            else:
-                st.warning(f"⚠️ Shared TG1 sequences found in {len(tg1_df)} other target(s)")
-                st.dataframe(tg1_df, use_container_width=True)
+                    unique_tg1 = this_tg1[~this_tg1["aa_sequence"].isin(shared_set)].head(100).copy()
+                    if unique_tg1.empty:
+                        st.info("No unique TG1 sequences found — all sequences appear in other TG1 libraries.")
+                    else:
+                        st.write(f"**{len(unique_tg1)} unique sequences** (not found in any other TG1 library)")
+                        unique_tg1.columns = ["AA Sequence", "Read count"]
+                        st.dataframe(unique_tg1, use_container_width=True)
 
 
 def page_ingest(conn: sqlite3.Connection, db_path: Path):
@@ -4192,46 +4185,62 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
                 if "ingest_assignments" not in st.session_state or st.session_state.get("ingest_folder") != folder_path:
                     assignments = {}
                     for t2, grp2 in sorted(groups.items()):
+                        rounds_init = {}
+                        for rnum, bc_list in sorted(grp2["rounds"].items()):
+                            rounds_init[rnum] = [bc_list[0]["label"]] if bc_list else []
                         assignments[t2] = {
                             "name": t2,
                             "tg1": grp2["tg1"][0]["label"] if grp2["tg1"] else "— (none)",
-                            "r1":  [grp2["rounds"][1][0]["label"]] if 1 in grp2["rounds"] else [],
-                            "r2":  [grp2["rounds"][2][0]["label"]] if 2 in grp2["rounds"] else [],
+                            "rounds": rounds_init,
                             "include": True,
+                            "extra_paths": {},
                         }
                     st.session_state["ingest_assignments"] = assignments
                     st.session_state["ingest_folder"] = folder_path
                 assignments = st.session_state["ingest_assignments"]
 
-                # Header
-                hcols = st.columns([0.15, 1.5, 1.5, 1.5, 1.5])
-                for col, hdr in zip(hcols, ["", "Target name", "TG1 (control)", "R1 (1x panned)", "R2 (2x panned)"]):
-                    col.markdown(f"**{hdr}**")
-
                 for t2 in sorted(assignments.keys()):
                     a = assignments[t2]
-                    if "extra_paths" not in a:
-                        a["extra_paths"] = {}  # label -> path, user-added external libs
+                    if "extra_paths" not in a: a["extra_paths"] = {}
+                    if "rounds" not in a:
+                        # migrate old r1/r2 format
+                        a["rounds"] = {}
+                        if a.get("r1"): a["rounds"][1] = a.pop("r1")
+                        if a.get("r2"): a["rounds"][2] = a.pop("r2")
 
-                    # Merge extra paths into available options
                     extra_labels = list(a["extra_paths"].keys())
                     all_tg1_opts = all_bc_labels + extra_labels
                     all_r_opts   = bc_options + extra_labels
 
-                    rc = st.columns([0.15, 1.5, 1.5, 1.5, 1.5])
-                    with rc[0]:
+                    st.markdown(f"**{a['name']}**")
+                    inc_col, name_col, tg1_col = st.columns([0.15, 2, 2])
+                    with inc_col:
                         a["include"] = st.checkbox("", value=a["include"], key=f"inc_{t2}", label_visibility="collapsed")
-                    with rc[1]:
-                        a["name"] = st.text_input("", value=a["name"], key=f"tname_{t2}", label_visibility="collapsed")
-                    with rc[2]:
+                    with name_col:
+                        a["name"] = st.text_input("Target name", value=a["name"], key=f"tname_{t2}")
+                    with tg1_col:
                         tg1_idx = all_tg1_opts.index(a["tg1"]) if a["tg1"] in all_tg1_opts else 0
-                        a["tg1"] = st.selectbox("", all_tg1_opts, index=tg1_idx, key=f"tg1s_{t2}", label_visibility="collapsed")
-                    with rc[3]:
-                        a["r1"] = st.multiselect("", all_r_opts,
-                            default=[x for x in a["r1"] if x in all_r_opts], key=f"r1s_{t2}", label_visibility="collapsed")
-                    with rc[4]:
-                        a["r2"] = st.multiselect("", all_r_opts,
-                            default=[x for x in a["r2"] if x in all_r_opts], key=f"r2s_{t2}", label_visibility="collapsed")
+                        a["tg1"] = st.selectbox("TG1 (control)", all_tg1_opts, index=tg1_idx, key=f"tg1s_{t2}")
+
+                    # Dynamic rounds
+                    round_nums = sorted(a["rounds"].keys())
+                    for rnum in round_nums:
+                        a["rounds"][rnum] = st.multiselect(
+                            f"Round {rnum}",
+                            all_r_opts,
+                            default=[x for x in a["rounds"][rnum] if x in all_r_opts],
+                            key=f"round_{t2}_{rnum}"
+                        )
+                    col_add, col_del = st.columns([1, 1])
+                    with col_add:
+                        if st.button(f"+ Add round", key=f"add_round_{t2}"):
+                            next_round = max(a["rounds"].keys()) + 1 if a["rounds"] else 1
+                            a["rounds"][next_round] = []
+                            st.rerun()
+                    with col_del:
+                        if round_nums and st.button(f"- Remove last round", key=f"del_round_{t2}"):
+                            del a["rounds"][max(round_nums)]
+                            st.rerun()
 
                     # Add external library expander
                     with st.expander(f"Add external library to {a['name']}", expanded=False):
@@ -4265,6 +4274,24 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
                 st.error("No barcode folders found.")
         else:
             st.error("Path does not exist.")
+
+
+    # Final ingest plan summary
+    assignments_fp = st.session_state.get('ingest_assignments', {})
+    if assignments_fp:
+        st.divider()
+        st.subheader('Final ingest plan')
+        st.caption('This is exactly what will be ingested.')
+        plan_rows = []
+        for orig_t, a in sorted(assignments_fp.items()):
+            if not a.get('include', True): continue
+            row = {'Target': a['name'], 'TG1': a.get('tg1', '—')}
+            for rnum in sorted(a.get('rounds', {}).keys()):
+                lbls = a['rounds'][rnum]
+                row[f'Round {rnum}'] = ', '.join(lbls) if lbls else '—'
+            plan_rows.append(row)
+        if plan_rows:
+            st.dataframe(pd.DataFrame(plan_rows), use_container_width=True)
 
     st.divider()
     START  = st.text_input("START anchor", value=DEFAULT_START)
@@ -4361,12 +4388,18 @@ def page_ingest(conn: sqlite3.Connection, db_path: Path):
                 if lbl in extra_paths: return Path(extra_paths[lbl])
                 return None
             if tg1_bc: ext_overrides[orig_target]["tg1_path"] = Path(tg1_bc["folder_path"])
-            r1_list = a["r1"] if isinstance(a["r1"], list) else ([a["r1"]] if a["r1"] else [])
-            r2_list = a["r2"] if isinstance(a["r2"], list) else ([a["r2"]] if a["r2"] else [])
-            r1_paths = [_resolve(lbl) for lbl in r1_list if _resolve(lbl)]
-            r2_paths = [_resolve(lbl) for lbl in r2_list if _resolve(lbl)]
-            if r1_paths: ext_overrides[orig_target]["r1_paths"] = r1_paths
-            if r2_paths: ext_overrides[orig_target]["r2_paths"] = r2_paths
+            rounds_a = a.get("rounds", {})
+            # Support old r1/r2 format
+            if not rounds_a:
+                r1 = a.get("r1", [])
+                r2 = a.get("r2", [])
+                if r1: rounds_a[1] = r1 if isinstance(r1, list) else [r1]
+                if r2: rounds_a[2] = r2 if isinstance(r2, list) else [r2]
+            for rnum, lbls in rounds_a.items():
+                paths = [_resolve(lbl) for lbl in (lbls if isinstance(lbls, list) else [lbls]) if _resolve(lbl)]
+                if paths:
+                    lib_name = "1xpanned" if rnum == 1 else "2xpanned" if rnum == 2 else f"{rnum}xpanned"
+                    ext_overrides[orig_target][f"{lib_name}_paths"] = paths
             ext_overrides[orig_target]["rename"] = a["name"].strip() or orig_target
         log_area = st.empty()
         msgs = []
