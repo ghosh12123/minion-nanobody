@@ -3367,8 +3367,8 @@ def page_enrichment(conn: sqlite3.Connection):
     # PDF export placeholder — above all sliders
     pdf_placeholder = st.empty()
 
-    show_sequences = st.checkbox("Show top cluster amino-acid sequences", value=True)
-    top_n = st.slider("How many top clusters to show", 1, 100, 30, disabled=not show_sequences)
+    show_sequences = True
+    top_n = st.slider("How many top clusters to show", 1, 100, 30)
 
     cache_key = f"cm_{run_id}_{target}"
     if cache_key not in st.session_state:
@@ -3653,11 +3653,15 @@ def page_enrichment(conn: sqlite3.Connection):
             cm_show[_col] = cm_show[_col].astype("Int64")
 
     # Build zero-control table using 1 as denominator
-    # last_round_col is the norm column e.g. "2xpanned_norm"
-    zero_num_col = last_round_col  # already the norm column
-    if not cm_zero_ctrl.empty and zero_num_col and zero_num_col in cm_zero_ctrl.columns:
-        cm_zero_ctrl["fold_enrichment"] = pd.to_numeric(cm_zero_ctrl[zero_num_col], errors="coerce").fillna(0) / 1.0
-        cm_zero_ctrl = cm_zero_ctrl.sort_values("fold_enrichment", ascending=False)
+    if not cm_zero_ctrl.empty:
+        # Find best column to rank by — last round norm, fallback to any norm
+        _zero_rank_col = last_round_col
+        if not _zero_rank_col or _zero_rank_col not in cm_zero_ctrl.columns:
+            _norm_cols = [c for c in cm_zero_ctrl.columns if c.endswith("_norm") and c != "control_norm"]
+            _zero_rank_col = _norm_cols[-1] if _norm_cols else None
+        if _zero_rank_col:
+            cm_zero_ctrl["fold_enrichment"] = pd.to_numeric(cm_zero_ctrl[_zero_rank_col], errors="coerce").fillna(0) / 1.0
+            cm_zero_ctrl = cm_zero_ctrl.sort_values("fold_enrichment", ascending=False)
         cm_zero_show = cm_zero_ctrl[display_cols].head(top_n).copy()
         for _col in [c for c in cm_zero_show.columns if c.endswith("_norm") or c == "fold_enrichment"]:
             cm_zero_show[_col] = pd.to_numeric(cm_zero_show[_col], errors="coerce").round(2 if _col == "fold_enrichment" else 0)
@@ -3691,123 +3695,151 @@ def page_enrichment(conn: sqlite3.Connection):
     else:
         st.dataframe(cm_show, use_container_width=True)
 
-    # Separate table for sequences with 0 control reads
+
+    # Zero control count matrix expander
     if not cm_zero_show.empty:
-        with st.expander(f"Sequences with 0 control reads ({len(cm_zero_ctrl):,} total)", expanded=False):
-            st.caption("These sequences had no reads in the control (TG1) library. "
-                       "Fold enrichment here is calculated using 1 in place of 0 for the control — "
-                       "treat these numbers as approximate.")
-            def highlight_sticky_zero(row):
+        with st.expander(f"Sequences with 0 control reads — count matrix ({len(cm_zero_ctrl):,} total)", expanded=False):
+            st.caption("These sequences had no reads in the control (TG1) library. Fold enrichment uses 1 as the denominator.")
+            def highlight_sticky_zero_cm(row):
                 if row.get("cluster_head") in sticky_cluster_heads:
                     return ["background-color: #fce8e8; color: #666666"] * len(row)
                 return [""] * len(row)
             if sticky_cluster_heads:
-                st.dataframe(cm_zero_show.style.apply(highlight_sticky_zero, axis=1), use_container_width=True)
+                st.dataframe(cm_zero_show.style.apply(highlight_sticky_zero_cm, axis=1), use_container_width=True)
             else:
                 st.dataframe(cm_zero_show, use_container_width=True)
 
-
     # Top sequences with sticky detection
-    if show_sequences:
-        # Sequence type toggle
-        show_aa = st.checkbox("Show amino acid sequences instead of nucleotide",
-                               value=False, key=f"show_aa_{run_id}_{target}")
-        seq_label = "amino-acid" if show_aa else "nucleotide"
-        st.subheader(f"Top {top_n} cluster {seq_label} sequences")
+    # Sequence type toggle
+    show_aa = st.checkbox("Show amino acid sequences instead of nucleotide",
+                           value=False, key=f"show_aa_{run_id}_{target}")
+    seq_label = "amino-acid" if show_aa else "nucleotide"
+    st.subheader(f"Top {top_n} cluster {seq_label} sequences")
 
-        top_ids = cm_display["cluster_head"].astype(str).head(top_n).tolist()
-        placeholders = ",".join(["?"]*len(top_ids))
+    top_ids = cm_display["cluster_head"].astype(str).head(top_n).tolist()
+    placeholders = ",".join(["?"]*len(top_ids))
 
-        # Fetch AA sequences
-        aa_df = sql_df(conn,
-            f"SELECT cluster_head, aa_sequence, aa_length FROM cluster_sequences WHERE run_id=? AND target=? AND cluster_head IN ({placeholders})",
-            (run_id, target, *top_ids))
-        aa_map = dict(zip(aa_df["cluster_head"], zip(aa_df["aa_sequence"], aa_df["aa_length"]))) if not aa_df.empty else {}
+    # Fetch AA sequences
+    aa_df = sql_df(conn,
+        f"SELECT cluster_head, aa_sequence, aa_length FROM cluster_sequences WHERE run_id=? AND target=? AND cluster_head IN ({placeholders})",
+        (run_id, target, *top_ids))
+    aa_map = dict(zip(aa_df["cluster_head"], zip(aa_df["aa_sequence"], aa_df["aa_length"]))) if not aa_df.empty else {}
 
-        # Fetch NT sequences
-        nt_df = sql_df(conn,
-            f"SELECT cluster_head, nt_sequence, nt_length FROM cluster_nt_sequences WHERE run_id=? AND target=? AND cluster_head IN ({placeholders})",
-            (run_id, target, *top_ids))
-        nt_map = dict(zip(nt_df["cluster_head"], zip(nt_df["nt_sequence"], nt_df["nt_length"]))) if not nt_df.empty else {}
+    # Fetch NT sequences
+    nt_df = sql_df(conn,
+        f"SELECT cluster_head, nt_sequence, nt_length FROM cluster_nt_sequences WHERE run_id=? AND target=? AND cluster_head IN ({placeholders})",
+        (run_id, target, *top_ids))
+    nt_map = dict(zip(nt_df["cluster_head"], zip(nt_df["nt_sequence"], nt_df["nt_length"]))) if not nt_df.empty else {}
 
-        has_nt = bool(nt_map)
-        if not has_nt and not show_aa:
-            st.caption("⚠️ Nucleotide sequences not available for this run — showing amino acid sequences. Re-ingest to populate.")
-            show_aa = True
+    has_nt = bool(nt_map)
+    if not has_nt and not show_aa:
+        st.caption("⚠️ Nucleotide sequences not available for this run — showing amino acid sequences. Re-ingest to populate.")
+        show_aa = True
 
-        if aa_map or nt_map:
-            # sticky_map already computed above
+    if aa_map or nt_map:
+        # sticky_map already computed above
 
-            # Build display dataframe
-            display_rows = []
-            for ch in top_ids:
-                aa_seq, aa_len = aa_map.get(ch, ("", 0))
-                nt_seq, nt_len = nt_map.get(ch, ("", 0))
-                hits = sticky_map.get(ch, [])
-                is_sticky = len(hits) > 0
-                appears_in = " | ".join([
-                    f"{h['run_name']} / {h['target']} ({h['barcode']}) — {h['read_count']} reads"
-                    for h in hits
-                ]) if hits else ""
+        # Build display dataframe
+        display_rows = []
+        for ch in top_ids:
+            aa_seq, aa_len = aa_map.get(ch, ("", 0))
+            nt_seq, nt_len = nt_map.get(ch, ("", 0))
+            hits = sticky_map.get(ch, [])
+            is_sticky = len(hits) > 0
+            appears_in = " | ".join([
+                f"{h['run_name']} / {h['target']} ({h['barcode']}) — {h['read_count']} reads"
+                for h in hits
+            ]) if hits else ""
 
-                if show_aa:
-                    row_dict = {
-                        "cluster_head": ch,
-                        "aa_sequence": aa_seq,
-                        "aa_length": aa_len,
-                    }
-                else:
-                    row_dict = {
-                        "cluster_head": ch,
-                        "nt_sequence": nt_seq,
-                        "nt_length": nt_len,
-                    }
-                display_rows.append(row_dict)
-
-            display_df = pd.DataFrame(display_rows)
-
-            def highlight_sticky(row):
-                if row.get("sticky") == "⚠️ YES":
-                    return ["background-color: #fce8e8; color: #666666"] * len(row)
-                return [""] * len(row)
-
-            def _highlight_sticky_seq(row):
-                ch = row.get("cluster_head", "")
-                if ch in sticky_cluster_heads:
-                    return ["background-color: #fce8e8; color: #666666"] * len(row)
-                return [""] * len(row)
-
-            def _highlight_sticky_seq_trim(row):
-                ch = row.get("cluster_head", "")
-                if ch in trimmed_sticky_heads:
-                    return ["background-color: #fce8e8; color: #666666"] * len(row)
-                return [""] * len(row)
-
-            st.dataframe(
-                display_df.style.apply(_highlight_sticky_seq, axis=1),
-                use_container_width=True
-            )
-
-            # FASTA export uses whichever sequence is shown
-            if show_aa and not aa_df.empty:
-                aa_df["_order"] = aa_df["cluster_head"].map({ch: i for i, ch in enumerate(top_ids)})
-                aa_df = aa_df.sort_values("_order").drop("_order", axis=1)
-                fasta_text = seq_df_to_fasta_text(aa_df.rename(columns={"aa_sequence":"aa_sequence"}))
-            elif not show_aa and not nt_df.empty:
-                nt_df["_order"] = nt_df["cluster_head"].map({ch: i for i, ch in enumerate(top_ids)})
-                nt_df = nt_df.sort_values("_order").drop("_order", axis=1)
-                fasta_text = "\n".join(
-                    f">{row['cluster_head']}\n{row['nt_sequence']}"
-                    for _, row in nt_df.iterrows() if row.get("nt_sequence")
-                )
+            if show_aa:
+                row_dict = {
+                    "cluster_head": ch,
+                    "aa_sequence": aa_seq,
+                    "aa_length": aa_len,
+                }
             else:
-                fasta_text = ""
+                row_dict = {
+                    "cluster_head": ch,
+                    "nt_sequence": nt_seq,
+                    "nt_length": nt_len,
+                }
+            display_rows.append(row_dict)
 
-            if fasta_text.strip():
-                clipboard_copy_button(fasta_text, label=f"Copy {seq_label} sequences (FASTA)",
-                                      key=f"{run_id}_{target}_top{top_n}_{seq_label}")
-                with st.expander("FASTA text (manual copy fallback)"):
-                    st.text_area("FASTA", value=fasta_text, height=220)
+        display_df = pd.DataFrame(display_rows)
+
+        def highlight_sticky(row):
+            if row.get("sticky") == "⚠️ YES":
+                return ["background-color: #fce8e8; color: #666666"] * len(row)
+            return [""] * len(row)
+
+        def _highlight_sticky_seq(row):
+            ch = row.get("cluster_head", "")
+            if ch in sticky_cluster_heads:
+                return ["background-color: #fce8e8; color: #666666"] * len(row)
+            return [""] * len(row)
+
+        def _highlight_sticky_seq_trim(row):
+            ch = row.get("cluster_head", "")
+            if ch in trimmed_sticky_heads:
+                return ["background-color: #fce8e8; color: #666666"] * len(row)
+            return [""] * len(row)
+
+        st.dataframe(
+            display_df.style.apply(_highlight_sticky_seq, axis=1),
+            use_container_width=True
+        )
+
+        # FASTA export uses whichever sequence is shown
+        if show_aa and not aa_df.empty:
+            aa_df["_order"] = aa_df["cluster_head"].map({ch: i for i, ch in enumerate(top_ids)})
+            aa_df = aa_df.sort_values("_order").drop("_order", axis=1)
+            fasta_text = seq_df_to_fasta_text(aa_df.rename(columns={"aa_sequence":"aa_sequence"}))
+        elif not show_aa and not nt_df.empty:
+            nt_df["_order"] = nt_df["cluster_head"].map({ch: i for i, ch in enumerate(top_ids)})
+            nt_df = nt_df.sort_values("_order").drop("_order", axis=1)
+            fasta_text = "\n".join(
+                f">{row['cluster_head']}\n{row['nt_sequence']}"
+                for _, row in nt_df.iterrows() if row.get("nt_sequence")
+            )
+        else:
+            fasta_text = ""
+
+        if fasta_text.strip():
+            clipboard_copy_button(fasta_text, label=f"Copy {seq_label} sequences (FASTA)",
+                                  key=f"{run_id}_{target}_top{top_n}_{seq_label}")
+            with st.expander("FASTA text (manual copy fallback)"):
+                st.text_area("FASTA", value=fasta_text, height=220)
+
+
+    if not cm_zero_show.empty:
+        with st.expander(f"Sequences with 0 control reads — top sequences ({len(cm_zero_ctrl):,} total)", expanded=False):
+            zero_ids = cm_zero_ctrl["cluster_head"].astype(str).head(top_n).tolist()
+            if zero_ids:
+                show_aa_zero = st.checkbox("Show amino acid sequences instead of nucleotide",
+                    value=False, key=f"show_aa_zero_{run_id}_{target}")
+                st.subheader(f"Top {len(zero_ids)} zero-control cluster {'amino-acid' if show_aa_zero else 'nucleotide'} sequences")
+                ph_zero = ",".join(["?"]*len(zero_ids))
+                if show_aa_zero:
+                    seq_zero = sql_df(conn,
+                        f"SELECT cluster_head, aa_sequence, aa_length FROM cluster_sequences WHERE run_id=? AND target=? AND cluster_head IN ({ph_zero})",
+                        (run_id, target, *zero_ids))
+                else:
+                    seq_zero = sql_df(conn,
+                        f"SELECT cluster_head, nt_sequence, nt_length FROM cluster_nt_sequences WHERE run_id=? AND target=? AND cluster_head IN ({ph_zero})",
+                        (run_id, target, *zero_ids))
+                    if seq_zero.empty:
+                        seq_zero = sql_df(conn,
+                            f"SELECT cluster_head, aa_sequence as nt_sequence, aa_length as nt_length FROM cluster_sequences WHERE run_id=? AND target=? AND cluster_head IN ({ph_zero})",
+                            (run_id, target, *zero_ids))
+                if not seq_zero.empty:
+                    seq_zero["_order"] = seq_zero["cluster_head"].map({ch: i for i, ch in enumerate(zero_ids)})
+                    seq_zero = seq_zero.sort_values("_order").drop("_order", axis=1)
+                    def _hl_zero_seq(row):
+                        return ["background-color: #fce8e8; color: #666666"] * len(row) if row.get("cluster_head") in sticky_cluster_heads else [""] * len(row)
+                    if sticky_cluster_heads:
+                        st.dataframe(seq_zero.style.apply(_hl_zero_seq, axis=1), use_container_width=True)
+                    else:
+                        st.dataframe(seq_zero, use_container_width=True)
 
 
     st.divider()
